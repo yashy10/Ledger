@@ -50,7 +50,7 @@ governance rules themselves and an AI-generated agent then attacks those rules.
 2. Display the URL + code on a slide. Audience visits `https://<host>/audience`, enters the
    code, and types a rule in plain English (e.g. *"no spend over $200"*). The Policy
    Copilot turns each submission into a structured rule scoped to the session's project.
-3. After ~20s (or click **Close window**), click **Generate adversarial agent**. Gemini
+3. After ~2 minutes (or click **Close window** early), click **Generate adversarial agent**. Gemini
    reads the submitted rules and drafts 8 probing actions — some clean, some designed to
    trip each rule.
 4. Click **Run**. The actions stream into the dashboard; Slack pings fire on violations;

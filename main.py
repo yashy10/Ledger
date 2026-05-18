@@ -57,9 +57,9 @@ LEARN_COST_UPPER_MULT = 1.5    # new cost may be up to 1.5× the historical max
 LEARN_COST_LOWER_MULT = 0.5    # …and down to 0.5× the historical min
 
 # Live audience session settings.
-SESSION_DEFAULT_WINDOW_S = 20
+SESSION_DEFAULT_WINDOW_S = 120  # 2-minute window for audience rule submissions
 SESSION_RUN_DELAY_S = 1.2
-AUDIENCE_THROTTLE_S = 5.0      # min seconds between submissions per IP
+AUDIENCE_THROTTLE_S = 5.0       # min seconds between submissions per IP
 
 log = logging.getLogger("ledger")
 logging.basicConfig(level=logging.INFO, format="[ledger] %(message)s")
