@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.DS_Store
+ledger.db
+ledger.db-journal
+*.sqlite
+*.sqlite-journal
