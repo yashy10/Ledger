@@ -9,3 +9,5 @@ ledger.db
 ledger.db-journal
 *.sqlite
 *.sqlite-journal
+learning.json
+learning.json.tmp

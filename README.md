@@ -40,18 +40,66 @@ H100 GPUs — $48,000`) trips the budget cap, fires a Slack approval card, and
 sits in `pending_approval`. Click **Approve** or **Deny** in the dashboard;
 the row updates and the decision is persisted.
 
+## Live audience-driven demo
+
+Ledger has a built-in "live session" mode for on-stage demos where the audience writes the
+governance rules themselves and an AI-generated agent then attacks those rules.
+
+1. Click **Start new session** in the dashboard's *Live Session* panel. A 4-digit code +
+   QR appear.
+2. Display the URL + code on a slide. Audience visits `https://<host>/audience`, enters the
+   code, and types a rule in plain English (e.g. *"no spend over $200"*). The Policy
+   Copilot turns each submission into a structured rule scoped to the session's project.
+3. After ~20s (or click **Close window**), click **Generate adversarial agent**. Gemini
+   reads the submitted rules and drafts 8 probing actions — some clean, some designed to
+   trip each rule.
+4. Click **Run**. The actions stream into the dashboard; Slack pings fire on violations;
+   the audience watches Ledger catch (or miss) rules they wrote 30 seconds ago.
+
+If Gemini is rate-limited or returns malformed JSON, a hardcoded 8-action fallback
+script runs so the demo never dead-ends.
+
+## Hosting (Render)
+
+`render.yaml` is included. To deploy:
+
+1. Push this repo to GitHub.
+2. In Render, click **New → Blueprint**, point at the repo. It picks up `render.yaml`
+   and provisions a web service + a 1 GB persistent disk at `/data` (where the SQLite
+   DB and `learning.json` live).
+3. In the Render dashboard, set `GEMINI_API_KEY` and `SLACK_WEBHOOK_URL` (left as
+   `sync: false` in `render.yaml` so the keys don't get committed).
+4. Once the build finishes, the public URL is e.g. `https://ledger.onrender.com`.
+   The audience page is at `/audience`.
+
+Render's free tier sleeps after 15 minutes idle (cold start ~30s). Pre-warm by hitting
+`/health` ~60s before going on stage.
+
 ## API
 
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/agent/action` | Agent submits an action for evaluation |
-| `GET`  | `/audit` | Recent actions (newest first) |
+| `GET`  | `/audit` | Recent actions (newest first; optional `?project_id=X`) |
 | `GET`  | `/audit/{action_id}` | Single action detail |
 | `POST` | `/approve/{action_id}` | `{"decision":"approved"|"denied","decided_by":"you@x"}` |
-| `GET`  | `/policies` | List active policies |
+| `GET`  | `/policies` | List active policies (optional `?project_id=X`) |
 | `POST` | `/policies` | Add a structured rule |
 | `POST` | `/policies/from_text` | Plain English → policy rule via Gemini |
 | `DELETE` | `/policies/{id}` | Deactivate a policy |
+| `GET`  | `/projects` | List projects + per-project counts |
+| `POST` | `/projects` | Create a project |
+| `POST` | `/projects/{id}/activate` | Set active project |
+| `DELETE` | `/projects/{id}` | Soft-delete a project |
+| `GET`  | `/learning` | Inspect the RL signature store |
+| `DELETE` | `/learning` | Wipe all learned patterns |
+| `POST` | `/sessions` | Start a live audience session (returns 4-digit code) |
+| `GET`  | `/sessions/{code}` | Session state |
+| `POST` | `/sessions/{code}/close` | Close the submission window |
+| `POST` | `/sessions/{code}/generate` | Gemini drafts the adversarial action list |
+| `POST` | `/sessions/{code}/run` | Fire the action list (background, ~10s) |
+| `POST` | `/audience/submit` | `{"code":"NNNN","text":"plain-English rule"}` |
+| `GET`  | `/audience` | Phone-friendly rule submission page |
 | `GET`  | `/health` | Liveness + integration status |
 | `GET`  | `/` | Dashboard HTML |
 

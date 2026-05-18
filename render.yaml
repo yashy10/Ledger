@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: ledger
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: LEDGER_DB
+        value: /data/ledger.db
+      - key: LEDGER_LEARNING
+        value: /data/learning.json
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: SLACK_WEBHOOK_URL
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest
+    disk:
+      name: ledger-data
+      mountPath: /data
+      sizeGB: 1

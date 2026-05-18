@@ -10,8 +10,10 @@ import json
 import hashlib
 import sqlite3
 import uuid
+import random
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
@@ -43,9 +45,21 @@ from pydantic import BaseModel
 
 # ---------- Config ----------
 DB_PATH = os.environ.get("LEDGER_DB", "ledger.db")
+LEARNING_PATH = os.environ.get("LEDGER_LEARNING", "learning.json")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+
+# Auto-approve thresholds for the learning store.
+LEARN_MIN_APPROVALS = 3        # need at least this many prior approvals
+LEARN_MAX_EXAMPLES = 10        # keep last N examples per signature
+LEARN_COST_UPPER_MULT = 1.5    # new cost may be up to 1.5× the historical max
+LEARN_COST_LOWER_MULT = 0.5    # …and down to 0.5× the historical min
+
+# Live audience session settings.
+SESSION_DEFAULT_WINDOW_S = 20
+SESSION_RUN_DELAY_S = 1.2
+AUDIENCE_THROTTLE_S = 5.0      # min seconds between submissions per IP
 
 log = logging.getLogger("ledger")
 logging.basicConfig(level=logging.INFO, format="[ledger] %(message)s")
@@ -95,6 +109,14 @@ def gemini_json(prompt: str, schema: Optional[dict] = None, system: Optional[str
 
 
 # ---------- DB ----------
+DEFAULT_PROJECT_ID = "default"
+
+
+def _column_exists(cur, table: str, column: str) -> bool:
+    rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(r[1] == column for r in rows)
+
+
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -123,7 +145,44 @@ def init_db() -> None:
             active INTEGER DEFAULT 1
         )
     """)
-    cur.execute("SELECT COUNT(*) FROM policies")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT,
+            created_at TEXT NOT NULL,
+            active_flag INTEGER DEFAULT 0,
+            deleted INTEGER DEFAULT 0
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            code TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            opened_until TEXT,
+            state TEXT NOT NULL,
+            generated_actions TEXT,
+            last_run_at TEXT
+        )
+    """)
+
+    # Migrations — add project_id columns to existing rows.
+    if not _column_exists(cur, "actions", "project_id"):
+        cur.execute(f"ALTER TABLE actions ADD COLUMN project_id TEXT DEFAULT '{DEFAULT_PROJECT_ID}'")
+    if not _column_exists(cur, "policies", "project_id"):
+        cur.execute(f"ALTER TABLE policies ADD COLUMN project_id TEXT DEFAULT '{DEFAULT_PROJECT_ID}'")
+
+    # Seed default project if none exist.
+    cur.execute("SELECT COUNT(*) FROM projects WHERE deleted=0")
+    if cur.fetchone()[0] == 0:
+        cur.execute(
+            "INSERT INTO projects (id, name, description, created_at, active_flag) VALUES (?, ?, ?, ?, 1)",
+            (DEFAULT_PROJECT_ID, "Default", "Initial project — applies to ungrouped actions and policies.", now_iso()),
+        )
+
+    # Seed default policies if the default project has none.
+    cur.execute("SELECT COUNT(*) FROM policies WHERE active=1 AND project_id=?", (DEFAULT_PROJECT_ID,))
     if cur.fetchone()[0] == 0:
         # Note: intent_alignment is available as a rule type but not seeded by default —
         # it would call Gemini on every approved action, which is wasteful for the demo
@@ -137,11 +196,64 @@ def init_db() -> None:
         ]
         for rule in defaults:
             cur.execute(
-                "INSERT INTO policies (id, created_at, rule_json, source) VALUES (?, ?, ?, ?)",
-                (str(uuid.uuid4()), now_iso(), json.dumps(rule), "default"),
+                "INSERT INTO policies (id, created_at, rule_json, source, project_id) VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), now_iso(), json.dumps(rule), "default", DEFAULT_PROJECT_ID),
             )
+
+    # Make sure exactly one project is active.
+    cur.execute("SELECT COUNT(*) FROM projects WHERE active_flag=1 AND deleted=0")
+    if cur.fetchone()[0] == 0:
+        cur.execute(
+            "UPDATE projects SET active_flag=1 WHERE id=? AND deleted=0",
+            (DEFAULT_PROJECT_ID,),
+        )
     conn.commit()
     conn.close()
+
+
+def get_active_project_id() -> str:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE active_flag=1 AND deleted=0 LIMIT 1"
+        ).fetchone()
+    return row["id"] if row else DEFAULT_PROJECT_ID
+
+
+def project_exists(project_id: str) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM projects WHERE id=? AND deleted=0", (project_id,)
+        ).fetchone()
+    return row is not None
+
+
+# ---------- Sessions ----------
+_audience_last_submit: dict = {}  # ip -> timestamp seconds; in-memory throttle
+
+
+def _generate_session_code() -> str:
+    """4-digit zero-padded code, retried on collision (with reasonable cap)."""
+    for _ in range(50):
+        code = f"{random.randint(0, 9999):04d}"
+        with db() as conn:
+            row = conn.execute("SELECT 1 FROM sessions WHERE code=?", (code,)).fetchone()
+        if not row:
+            return code
+    raise HTTPException(status_code=500, detail="could not allocate a session code")
+
+
+def get_session(code: str) -> Optional[dict]:
+    with db() as conn:
+        row = conn.execute("SELECT * FROM sessions WHERE code=?", (code,)).fetchone()
+    return dict(row) if row else None
+
+
+def session_seconds_remaining(sess: dict) -> int:
+    if not sess.get("opened_until"):
+        return 0
+    cutoff = datetime.fromisoformat(sess["opened_until"])
+    delta = (cutoff - datetime.now(timezone.utc)).total_seconds()
+    return max(0, int(delta))
 
 
 @contextmanager
@@ -164,11 +276,124 @@ def sha256_hex(payload: dict) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+# ---------- Learning store (reinforcement from human decisions) ----------
+# Persisted as JSON. Each signature is a (project_id, category, cost_bucket) tuple.
+# When an action whose signature has ≥ LEARN_MIN_APPROVALS approvals, zero denials,
+# and a cost within the learned range comes in as pending_approval, we flip it to
+# approved with a "learned_pattern" marker.
+COST_BUCKETS = [
+    (1, "$0-1"),
+    (10, "$1-10"),
+    (100, "$10-100"),
+    (1_000, "$100-1K"),
+    (10_000, "$1K-10K"),
+    (float("inf"), "$10K+"),
+]
+
+
+def cost_bucket(cost: float) -> str:
+    for limit, label in COST_BUCKETS:
+        if cost < limit:
+            return label
+    return "$10K+"
+
+
+def signature_key(project_id: str, category: str, cost: float) -> str:
+    return f"{project_id}/{(category or '_').lower()}/{cost_bucket(cost)}"
+
+
+def load_learning() -> dict:
+    p = Path(LEARNING_PATH)
+    if not p.exists():
+        return {"version": 1, "signatures": {}, "updated_at": None}
+    try:
+        data = json.loads(p.read_text())
+        data.setdefault("signatures", {})
+        return data
+    except Exception as e:  # noqa: BLE001
+        log.warning("learning store unreadable, starting fresh: %s", e)
+        return {"version": 1, "signatures": {}, "updated_at": None}
+
+
+def save_learning(data: dict) -> None:
+    data["updated_at"] = now_iso()
+    p = Path(LEARNING_PATH)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def record_learning(project_id: str, category: str, cost: float,
+                    description: str, action_id: str, decision: str) -> None:
+    data = load_learning()
+    key = signature_key(project_id, category, cost)
+    sig = data["signatures"].setdefault(key, {
+        "project_id": project_id,
+        "category": (category or "").lower(),
+        "cost_bucket": cost_bucket(cost),
+        "approved_count": 0,
+        "denied_count": 0,
+        "min_approved_cost": None,
+        "max_approved_cost": None,
+        "first_seen_at": now_iso(),
+        "examples": [],
+    })
+    if decision == "approved":
+        sig["approved_count"] += 1
+        sig["min_approved_cost"] = (
+            cost if sig["min_approved_cost"] is None else min(sig["min_approved_cost"], cost)
+        )
+        sig["max_approved_cost"] = (
+            cost if sig["max_approved_cost"] is None else max(sig["max_approved_cost"], cost)
+        )
+    elif decision == "denied":
+        sig["denied_count"] += 1
+    sig["last_decision"] = decision
+    sig["last_decision_at"] = now_iso()
+    sig["examples"].append({
+        "action_id": action_id,
+        "cost_usd": cost,
+        "description": (description or "")[:120],
+        "decision": decision,
+        "at": now_iso(),
+    })
+    sig["examples"] = sig["examples"][-LEARN_MAX_EXAMPLES:]
+    save_learning(data)
+
+
+def learning_auto_approve(project_id: str, category: str, cost: float) -> Optional[dict]:
+    """If learned history is strong enough to auto-approve, return reasoning. Else None."""
+    data = load_learning()
+    key = signature_key(project_id, category, cost)
+    sig = data["signatures"].get(key)
+    if not sig:
+        return None
+    if sig["denied_count"] > 0:
+        return None
+    if sig["approved_count"] < LEARN_MIN_APPROVALS:
+        return None
+    min_c = sig.get("min_approved_cost")
+    max_c = sig.get("max_approved_cost")
+    if min_c is None or max_c is None:
+        return None
+    lower = min_c * LEARN_COST_LOWER_MULT
+    upper = max_c * LEARN_COST_UPPER_MULT
+    if cost < lower or cost > upper:
+        return None
+    return {
+        "approvals": sig["approved_count"],
+        "min": min_c,
+        "max": max_c,
+        "key": key,
+    }
+
+
 # ---------- Models ----------
 class ActionRequest(BaseModel):
     agent_id: str
     task: str
     action: dict
+    project_id: Optional[str] = None  # falls back to the active project if omitted
 
 
 class ActionResponse(BaseModel):
@@ -178,6 +403,7 @@ class ActionResponse(BaseModel):
     rule_violated: Optional[str] = None
     sha256: str
     timestamp: str
+    project_id: str
 
 
 class ApprovalRequest(BaseModel):
@@ -187,15 +413,37 @@ class ApprovalRequest(BaseModel):
 
 class PolicyFromTextRequest(BaseModel):
     text: str
+    project_id: Optional[str] = None
+
+
+class ProjectCreateRequest(BaseModel):
+    id: str
+    name: str
+    description: Optional[str] = None
+
+
+class SessionCreateRequest(BaseModel):
+    window_seconds: Optional[int] = None  # defaults to SESSION_DEFAULT_WINDOW_S
+
+
+class AudienceSubmitRequest(BaseModel):
+    code: str
+    text: str
 
 
 # ---------- Policy Engine ----------
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
-def get_active_policies() -> list:
+def get_active_policies(project_id: Optional[str] = None) -> list:
     with db() as conn:
-        rows = conn.execute("SELECT rule_json FROM policies WHERE active=1").fetchall()
+        if project_id is None:
+            rows = conn.execute("SELECT rule_json FROM policies WHERE active=1").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT rule_json FROM policies WHERE active=1 AND project_id=?",
+                (project_id,),
+            ).fetchall()
     return [json.loads(r["rule_json"]) for r in rows]
 
 
@@ -234,8 +482,9 @@ def intent_alignment_check(task: str, action: dict) -> dict:
     }
 
 
-def evaluate_action(task: str, action: dict, policies: list) -> dict:
-    """Returns {'verdict', 'reasoning', 'rule_violated'}."""
+def evaluate_action(task: str, action: dict, policies: list, project_id: str) -> dict:
+    """Returns {'verdict', 'reasoning', 'rule_violated'}. May flip a pending_approval
+    to approved when the learning store has enough confidence in the signature."""
     raw_cost = action.get("cost_usd", 0) or 0
     try:
         cost = float(raw_cost)
@@ -250,6 +499,7 @@ def evaluate_action(task: str, action: dict, policies: list) -> dict:
     hour = now.hour
 
     intent_rule_present = False
+    pending: Optional[dict] = None  # first pending verdict from deterministic checks
 
     # Deterministic checks first.
     for rule in policies:
@@ -258,8 +508,8 @@ def evaluate_action(task: str, action: dict, policies: list) -> dict:
         if rtype == "budget_cap":
             limit = float(rule.get("limit_usd", 0))
             scope = rule.get("scope", "single_action")
-            if scope == "single_action" and cost > limit:
-                return {
+            if scope == "single_action" and cost > limit and pending is None:
+                pending = {
                     "verdict": "pending_approval",
                     "reasoning": f"Action cost ${cost:,.2f} exceeds the ${limit:,.2f} single-action budget cap. Human approval required.",
                     "rule_violated": f"budget_cap (limit ${limit:,.2f})",
@@ -269,8 +519,8 @@ def evaluate_action(task: str, action: dict, policies: list) -> dict:
             cats = [c.lower() for c in rule.get("categories", [])]
             if category and (category in cats or "all" in cats):
                 threshold = float(rule.get("approval_threshold_usd", 0))
-                if cost > threshold:
-                    return {
+                if cost > threshold and pending is None:
+                    pending = {
                         "verdict": "pending_approval",
                         "reasoning": f"Category '{category}' over ${threshold:,.2f} requires approval. This action: ${cost:,.2f}.",
                         "rule_violated": f"category_block ({category})",
@@ -283,13 +533,13 @@ def evaluate_action(task: str, action: dict, policies: list) -> dict:
             cat_matches = (not block_cats) or "all" in block_cats or category in block_cats
             day_match = day_name in block_days if block_days else False
             hour_match = hour in block_hours if block_hours else False
-            if cat_matches and (day_match or hour_match):
+            if cat_matches and (day_match or hour_match) and pending is None:
                 trigger = []
                 if day_match:
                     trigger.append(f"day={day_name}")
                 if hour_match:
                     trigger.append(f"hour={hour:02d}")
-                return {
+                pending = {
                     "verdict": "pending_approval",
                     "reasoning": f"Action falls inside a restricted time window ({', '.join(trigger)}). Human approval required.",
                     "rule_violated": f"time_window ({rule.get('description', 'restricted window')})",
@@ -298,12 +548,38 @@ def evaluate_action(task: str, action: dict, policies: list) -> dict:
         elif rtype == "intent_alignment":
             intent_rule_present = bool(rule.get("use_llm", False))
 
+    # If a deterministic rule produced pending_approval, see whether the learning
+    # store has enough prior approvals in this signature to flip it to approved.
+    if pending is not None:
+        learned = learning_auto_approve(project_id, category, cost)
+        if learned is not None:
+            return {
+                "verdict": "approved",
+                "reasoning": (
+                    f"Auto-approved from learning history: {learned['approvals']} prior approvals "
+                    f"of similar actions (${learned['min']:,.2f}–${learned['max']:,.2f}), no denials. "
+                    f"Original policy concern: {pending['rule_violated']}."
+                ),
+                "rule_violated": f"learned_pattern ({learned['key']})",
+            }
+        return pending
+
     # Gemini intent check only runs if deterministic checks pass, a rule asks for it,
     # and the cost is non-trivial (cheap actions skip the LLM call to conserve quota).
     INTENT_COST_FLOOR = 100.0
     if intent_rule_present and _gemini_ready and cost >= INTENT_COST_FLOOR:
         intent = intent_alignment_check(task, action)
         if not intent["aligned"]:
+            learned = learning_auto_approve(project_id, category, cost)
+            if learned is not None:
+                return {
+                    "verdict": "approved",
+                    "reasoning": (
+                        f"Auto-approved from learning history: {learned['approvals']} prior approvals "
+                        f"despite intent flag. Original concern: {intent['reasoning']}"
+                    ),
+                    "rule_violated": f"learned_pattern ({learned['key']})",
+                }
             return {
                 "verdict": "pending_approval",
                 "reasoning": f"Intent drift flagged by Gemini: {intent['reasoning']}",
@@ -445,11 +721,122 @@ def generate_policy_from_text(text: str) -> dict:
     if not _gemini_ready:
         raise HTTPException(status_code=503, detail="Gemini not configured. Set GEMINI_API_KEY.")
     prompt = f"Plain-English policy:\n\"\"\"\n{text}\n\"\"\"\n\nReturn one JSON rule."
+
+    # Single retry — Gemini occasionally returns an empty body on first try.
     rule = gemini_json(prompt, system=POLICY_COPILOT_SYSTEM)
+    if not rule or not rule.get("type"):
+        rule = gemini_json(prompt, system=POLICY_COPILOT_SYSTEM)
+
     err = validate_rule(rule)
     if err:
+        # Friendlier message — the audience submission page surfaces `detail` verbatim.
+        if not rule or not rule.get("type"):
+            raise HTTPException(
+                status_code=400,
+                detail="Couldn't parse that rule. Try rephrasing — e.g. 'no spending over $500' or 'block GPU on weekends'.",
+            )
         raise HTTPException(status_code=400, detail={"error": err, "model_output": rule})
     return rule
+
+
+# ---------- Adversarial agent generator (for live audience sessions) ----------
+ADVERSARIAL_AGENT_SYSTEM = """You are designing a stress-test for a corporate AI agent governance system called Ledger.
+
+The audience just wrote rules — your job is to design exactly 8 actions a DevOps/finance agent might attempt that PROBE those rules:
+- 4-5 actions should be ordinary, low-cost, within all rules (so we see green approvals)
+- 3-4 actions should specifically test the rules — high cost, blocked category, off-task purpose
+- At least ONE action should be a dramatic violation ($10K+ cost OR an explicit category-block hit)
+
+Allowed categories: gpu_provisioning, storage, compute, networking, database, monitoring, vendor_payment, ads_spend, api_call, training_data.
+Allowed types: provision, api_call, payment.
+
+Each action must conform to:
+  {"type": "<type>", "category": "<category>", "cost_usd": <number>, "description": "<short string>"}
+
+Return STRICT JSON: {"actions": [<8 action objects>]}. No prose. No markdown fences. No more or fewer than 8 actions.
+"""
+
+
+ADVERSARIAL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "actions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string"},
+                    "category": {"type": "string"},
+                    "cost_usd": {"type": "number"},
+                    "description": {"type": "string"},
+                },
+                "required": ["type", "category", "cost_usd", "description"],
+            },
+        }
+    },
+    "required": ["actions"],
+}
+
+
+# Pre-canned fallback used when Gemini is rate-limited or returns garbage,
+# so the live demo never dead-ends.
+FALLBACK_ACTIONS = [
+    {"type": "provision", "category": "storage",          "cost_usd": 12,    "description": "10GB cloud storage"},
+    {"type": "api_call",  "category": "compute",          "cost_usd": 0.50,  "description": "Database connection setup"},
+    {"type": "provision", "category": "compute",          "cost_usd": 42,    "description": "Small VM (4 vCPU, 16GB)"},
+    {"type": "provision", "category": "networking",       "cost_usd": 8,     "description": "Load balancer + TLS cert"},
+    {"type": "provision", "category": "gpu_provisioning", "cost_usd": 48000, "description": "100x NVIDIA H100 GPUs for 24h"},
+    {"type": "provision", "category": "storage",          "cost_usd": 18,    "description": "Container registry pull"},
+    {"type": "payment",   "category": "vendor_payment",   "cost_usd": 2400,  "description": "External contractor invoice"},
+    {"type": "provision", "category": "database",         "cost_usd": 60,    "description": "Managed Postgres instance"},
+]
+
+
+def _valid_action_shape(a: dict) -> bool:
+    if not isinstance(a, dict):
+        return False
+    for f in ("type", "category", "cost_usd", "description"):
+        if f not in a:
+            return False
+    try:
+        float(a["cost_usd"])
+    except (TypeError, ValueError):
+        return False
+    return all(isinstance(a[k], str) for k in ("type", "category", "description"))
+
+
+def generate_adversarial_actions(rules: list, n: int = 8) -> list:
+    """Ask Gemini to draft an adversarial action list given the audience's rules.
+    Falls back to FALLBACK_ACTIONS if anything goes wrong."""
+    if not rules:
+        # Without rules, just use the fallback set so the demo still runs.
+        return FALLBACK_ACTIONS[:n]
+
+    rules_str = "\n".join(
+        f"{i+1}. {r.get('description') or json.dumps(r)}" for i, r in enumerate(rules)
+    )
+    prompt = (
+        f"Audience-written rules to probe:\n{rules_str}\n\n"
+        f"Generate exactly {n} actions as instructed."
+    )
+    out = gemini_json(prompt, schema=ADVERSARIAL_SCHEMA, system=ADVERSARIAL_AGENT_SYSTEM,
+                      timeout_s=12.0)
+    actions = out.get("actions") if isinstance(out, dict) else None
+    if not isinstance(actions, list) or len(actions) < 1:
+        log.warning("adversarial agent: Gemini returned no actions, using fallback")
+        return FALLBACK_ACTIONS[:n]
+
+    clean = [a for a in actions if _valid_action_shape(a)]
+    if len(clean) < 4:
+        log.warning("adversarial agent: only %d valid actions, using fallback", len(clean))
+        return FALLBACK_ACTIONS[:n]
+
+    # Pad/truncate to exactly n.
+    if len(clean) > n:
+        clean = clean[:n]
+    while len(clean) < n:
+        clean.append(FALLBACK_ACTIONS[len(clean) % len(FALLBACK_ACTIONS)])
+    return clean
 
 
 # ---------- App ----------
@@ -474,6 +861,8 @@ def startup() -> None:
         f"  │  Gemini:     {'configured' if _gemini_ready else 'not configured (set GEMINI_API_KEY)':<46} │\n"
         f"  │  Slack:      {'configured' if SLACK_WEBHOOK_URL else 'not configured (set SLACK_WEBHOOK_URL)':<46} │\n"
         f"  │  DB:         {DB_PATH:<46} │\n"
+        f"  │  Learning:   {LEARNING_PATH:<46} │\n"
+        f"  │  Project:    {get_active_project_id():<46} │\n"
         "  └─────────────────────────────────────────────────────────────┘\n"
     )
     print(banner)
@@ -481,14 +870,19 @@ def startup() -> None:
 
 @app.post("/agent/action", response_model=ActionResponse)
 def agent_action(req: ActionRequest):
+    project_id = req.project_id or get_active_project_id()
+    if not project_exists(project_id):
+        raise HTTPException(status_code=400, detail=f"unknown project_id: {project_id}")
+
     action_id = str(uuid.uuid4())
     ts = now_iso()
-    policies = get_active_policies()
-    result = evaluate_action(req.task, req.action, policies)
+    policies = get_active_policies(project_id=project_id)
+    result = evaluate_action(req.task, req.action, policies, project_id=project_id)
 
     payload_for_hash = {
         "id": action_id,
         "timestamp": ts,
+        "project_id": project_id,
         "agent_id": req.agent_id,
         "task": req.task,
         "action": req.action,
@@ -500,13 +894,15 @@ def agent_action(req: ActionRequest):
         conn.execute(
             """
             INSERT INTO actions
-              (id, timestamp, agent_id, task, action_json, verdict, reasoning, rule_violated, sha256)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              (id, timestamp, agent_id, task, action_json, verdict, reasoning,
+               rule_violated, sha256, project_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 action_id, ts, req.agent_id, req.task,
                 json.dumps(req.action), result["verdict"],
                 result["reasoning"], result.get("rule_violated"), hash_hex,
+                project_id,
             ),
         )
 
@@ -528,15 +924,22 @@ def agent_action(req: ActionRequest):
         rule_violated=result.get("rule_violated"),
         sha256=hash_hex,
         timestamp=ts,
+        project_id=project_id,
     )
 
 
 @app.get("/audit")
-def audit_log(limit: int = 100):
+def audit_log(limit: int = 100, project_id: Optional[str] = None):
     with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM actions ORDER BY timestamp DESC LIMIT ?", (limit,)
-        ).fetchall()
+        if project_id:
+            rows = conn.execute(
+                "SELECT * FROM actions WHERE project_id=? ORDER BY timestamp DESC LIMIT ?",
+                (project_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM actions ORDER BY timestamp DESC LIMIT ?", (limit,)
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -573,42 +976,71 @@ def approve(action_id: str, body: ApprovalRequest):
             (body.decision, decided_at, body.decided_by, action_id),
         )
         updated = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
+
+    # Feed the learning store. Done outside the DB context to keep the txn short.
+    try:
+        action_json = json.loads(updated["action_json"])
+        record_learning(
+            project_id=updated["project_id"] or DEFAULT_PROJECT_ID,
+            category=(action_json.get("category") or "").lower(),
+            cost=float(action_json.get("cost_usd", 0) or 0),
+            description=action_json.get("description") or "",
+            action_id=action_id,
+            decision=body.decision,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("learning update failed for %s: %s", action_id, e)
+
     return dict(updated)
 
 
 @app.get("/policies")
-def list_policies():
+def list_policies(project_id: Optional[str] = None):
     with db() as conn:
-        rows = conn.execute(
-            "SELECT id, created_at, rule_json, source, active FROM policies WHERE active=1 ORDER BY created_at DESC"
-        ).fetchall()
+        if project_id:
+            rows = conn.execute(
+                "SELECT id, created_at, rule_json, source, active, project_id FROM policies "
+                "WHERE active=1 AND project_id=? ORDER BY created_at DESC",
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, created_at, rule_json, source, active, project_id FROM policies "
+                "WHERE active=1 ORDER BY created_at DESC"
+            ).fetchall()
     return [{**dict(r), "rule": json.loads(r["rule_json"])} for r in rows]
 
 
 @app.post("/policies")
-def add_policy(rule: dict):
+def add_policy(rule: dict, project_id: Optional[str] = None):
     err = validate_rule(rule)
     if err:
         raise HTTPException(status_code=400, detail=err)
+    target = project_id or get_active_project_id()
+    if not project_exists(target):
+        raise HTTPException(status_code=400, detail=f"unknown project_id: {target}")
     pid = str(uuid.uuid4())
     with db() as conn:
         conn.execute(
-            "INSERT INTO policies (id, created_at, rule_json, source) VALUES (?, ?, ?, ?)",
-            (pid, now_iso(), json.dumps(rule), "manual"),
+            "INSERT INTO policies (id, created_at, rule_json, source, project_id) VALUES (?, ?, ?, ?, ?)",
+            (pid, now_iso(), json.dumps(rule), "manual", target),
         )
-    return {"id": pid, "rule": rule}
+    return {"id": pid, "rule": rule, "project_id": target}
 
 
 @app.post("/policies/from_text")
 def policy_from_text(req: PolicyFromTextRequest):
+    target = req.project_id or get_active_project_id()
+    if not project_exists(target):
+        raise HTTPException(status_code=400, detail=f"unknown project_id: {target}")
     rule = generate_policy_from_text(req.text)
     pid = str(uuid.uuid4())
     with db() as conn:
         conn.execute(
-            "INSERT INTO policies (id, created_at, rule_json, source) VALUES (?, ?, ?, ?)",
-            (pid, now_iso(), json.dumps(rule), "copilot"),
+            "INSERT INTO policies (id, created_at, rule_json, source, project_id) VALUES (?, ?, ?, ?, ?)",
+            (pid, now_iso(), json.dumps(rule), "copilot", target),
         )
-    return {"id": pid, "rule": rule, "source_text": req.text}
+    return {"id": pid, "rule": rule, "source_text": req.text, "project_id": target}
 
 
 @app.delete("/policies/{policy_id}")
@@ -620,6 +1052,352 @@ def deactivate_policy(policy_id: str):
     return {"id": policy_id, "active": False}
 
 
+# ---------- Projects ----------
+@app.get("/projects")
+def list_projects():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT id, name, description, created_at, active_flag FROM projects "
+            "WHERE deleted=0 ORDER BY created_at ASC"
+        ).fetchall()
+        # Per-project policy + action counts.
+        counts = {}
+        for r in conn.execute(
+            "SELECT project_id, COUNT(*) AS n FROM policies WHERE active=1 GROUP BY project_id"
+        ).fetchall():
+            counts.setdefault(r["project_id"], {})["policies"] = r["n"]
+        for r in conn.execute(
+            "SELECT project_id, COUNT(*) AS n FROM actions GROUP BY project_id"
+        ).fetchall():
+            counts.setdefault(r["project_id"], {})["actions"] = r["n"]
+    projects = []
+    for r in rows:
+        d = dict(r)
+        c = counts.get(d["id"], {})
+        d["policy_count"] = c.get("policies", 0)
+        d["action_count"] = c.get("actions", 0)
+        d["active"] = bool(d.pop("active_flag"))
+        projects.append(d)
+    return projects
+
+
+@app.post("/projects")
+def create_project(req: ProjectCreateRequest):
+    pid = req.id.strip().lower()
+    if not pid or not pid.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="project id must be alphanumeric (dashes and underscores allowed)",
+        )
+    with db() as conn:
+        existing = conn.execute(
+            "SELECT deleted FROM projects WHERE id=?", (pid,)
+        ).fetchone()
+        if existing and existing["deleted"] == 0:
+            raise HTTPException(status_code=409, detail=f"project '{pid}' already exists")
+        if existing:  # soft-deleted — undelete + update
+            conn.execute(
+                "UPDATE projects SET name=?, description=?, deleted=0 WHERE id=?",
+                (req.name, req.description, pid),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO projects (id, name, description, created_at, active_flag) VALUES (?, ?, ?, ?, 0)",
+                (pid, req.name, req.description, now_iso()),
+            )
+        row = conn.execute(
+            "SELECT id, name, description, created_at, active_flag FROM projects WHERE id=?", (pid,)
+        ).fetchone()
+    d = dict(row)
+    d["active"] = bool(d.pop("active_flag"))
+    return d
+
+
+@app.post("/projects/{project_id}/activate")
+def activate_project(project_id: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE id=? AND deleted=0", (project_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="project not found")
+        conn.execute("UPDATE projects SET active_flag=0")
+        conn.execute("UPDATE projects SET active_flag=1 WHERE id=?", (project_id,))
+    return {"id": project_id, "active": True}
+
+
+@app.delete("/projects/{project_id}")
+def delete_project(project_id: str):
+    if project_id == DEFAULT_PROJECT_ID:
+        raise HTTPException(status_code=400, detail="cannot delete the default project")
+    with db() as conn:
+        row = conn.execute(
+            "SELECT active_flag FROM projects WHERE id=? AND deleted=0", (project_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="project not found")
+        conn.execute("UPDATE projects SET deleted=1, active_flag=0 WHERE id=?", (project_id,))
+        # If the deleted project was active, fall back to default.
+        if row["active_flag"]:
+            conn.execute("UPDATE projects SET active_flag=1 WHERE id=?", (DEFAULT_PROJECT_ID,))
+    return {"id": project_id, "deleted": True}
+
+
+# ---------- Learning ----------
+@app.get("/learning")
+def get_learning(project_id: Optional[str] = None):
+    data = load_learning()
+    if project_id:
+        data = {
+            **data,
+            "signatures": {
+                k: v for k, v in data.get("signatures", {}).items()
+                if v.get("project_id") == project_id
+            },
+        }
+    return data
+
+
+@app.delete("/learning")
+def reset_learning():
+    save_learning({"version": 1, "signatures": {}})
+    return {"ok": True, "cleared": True}
+
+
+@app.delete("/learning/{key:path}")
+def delete_learning_signature(key: str):
+    data = load_learning()
+    if key not in data.get("signatures", {}):
+        raise HTTPException(status_code=404, detail="signature not found")
+    data["signatures"].pop(key, None)
+    save_learning(data)
+    return {"ok": True, "removed": key}
+
+
+# ---------- Live audience sessions ----------
+def _serialize_session(sess: dict) -> dict:
+    """Add derived fields the dashboard cares about."""
+    out = dict(sess)
+    out["seconds_remaining"] = session_seconds_remaining(sess)
+    # Decode the stored actions JSON for convenience.
+    if out.get("generated_actions"):
+        try:
+            out["generated_actions"] = json.loads(out["generated_actions"])
+        except Exception:  # noqa: BLE001
+            out["generated_actions"] = []
+    # Count rules + executed actions in the session's project.
+    with db() as conn:
+        rule_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM policies WHERE active=1 AND project_id=?",
+            (out["project_id"],),
+        ).fetchone()
+        act_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM actions WHERE project_id=?",
+            (out["project_id"],),
+        ).fetchone()
+    out["rule_count"] = rule_row["n"]
+    out["action_count"] = act_row["n"]
+    return out
+
+
+@app.post("/sessions")
+def create_session(req: Optional[SessionCreateRequest] = None):
+    window = (req.window_seconds if req and req.window_seconds else SESSION_DEFAULT_WINDOW_S)
+    window = max(5, min(window, 300))
+
+    code = _generate_session_code()
+    project_id = f"s{code}"
+    project_name = f"Session {code}"
+    now = now_iso()
+    opened_until = (datetime.now(timezone.utc) + timedelta(seconds=window)).isoformat()
+
+    with db() as conn:
+        # Create the session-scoped project + activate it so the dashboard switches.
+        conn.execute(
+            "INSERT INTO projects (id, name, description, created_at, active_flag) VALUES (?, ?, ?, ?, 0)",
+            (project_id, project_name, "Live audience-driven demo session.", now),
+        )
+        conn.execute("UPDATE projects SET active_flag=0")
+        conn.execute("UPDATE projects SET active_flag=1 WHERE id=?", (project_id,))
+        conn.execute(
+            "INSERT INTO sessions (code, project_id, created_at, opened_until, state) VALUES (?, ?, ?, ?, 'open')",
+            (code, project_id, now, opened_until),
+        )
+        row = conn.execute("SELECT * FROM sessions WHERE code=?", (code,)).fetchone()
+
+    return {**_serialize_session(dict(row)), "audience_path": f"/audience?code={code}"}
+
+
+@app.get("/sessions")
+def list_sessions():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM sessions ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+    return [_serialize_session(dict(r)) for r in rows]
+
+
+@app.get("/sessions/{code}")
+def get_session_endpoint(code: str):
+    sess = get_session(code)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    return _serialize_session(sess)
+
+
+@app.post("/sessions/{code}/close")
+def close_session(code: str):
+    sess = get_session(code)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    with db() as conn:
+        conn.execute(
+            "UPDATE sessions SET state='closed', opened_until=? WHERE code=?",
+            (now_iso(), code),
+        )
+        row = conn.execute("SELECT * FROM sessions WHERE code=?", (code,)).fetchone()
+    return _serialize_session(dict(row))
+
+
+@app.post("/sessions/{code}/generate")
+def generate_session_agent(code: str):
+    sess = get_session(code)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    rules = get_active_policies(project_id=sess["project_id"])
+    actions = generate_adversarial_actions(rules)
+    with db() as conn:
+        conn.execute(
+            "UPDATE sessions SET state='agent_ready', generated_actions=? WHERE code=?",
+            (json.dumps(actions), code),
+        )
+        row = conn.execute("SELECT * FROM sessions WHERE code=?", (code,)).fetchone()
+    return _serialize_session(dict(row))
+
+
+async def _fire_session_actions(code: str, project_id: str, actions: list) -> None:
+    """Background runner: fires each action with a delay so it streams to the dashboard."""
+    for i, action in enumerate(actions):
+        req = ActionRequest(
+            agent_id=f"audience-agent-{code}",
+            task=f"Stress-test session {code}'s rules",
+            action=action,
+            project_id=project_id,
+        )
+        try:
+            agent_action(req)  # synchronous DB write, fine from an async task
+        except HTTPException as e:
+            log.warning("session %s action %d failed: %s", code, i, e.detail)
+        except Exception as e:  # noqa: BLE001
+            log.warning("session %s action %d errored: %s", code, i, e)
+        if i < len(actions) - 1:
+            await asyncio.sleep(SESSION_RUN_DELAY_S)
+    with db() as conn:
+        conn.execute(
+            "UPDATE sessions SET state='completed', last_run_at=? WHERE code=?",
+            (now_iso(), code),
+        )
+
+
+@app.post("/sessions/{code}/run")
+async def run_session_agent(code: str):
+    sess = get_session(code)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    if not sess.get("generated_actions"):
+        raise HTTPException(
+            status_code=409,
+            detail="no agent actions generated yet — call /sessions/{code}/generate first",
+        )
+    try:
+        actions = json.loads(sess["generated_actions"])
+    except Exception:
+        raise HTTPException(status_code=500, detail="stored actions are not valid JSON")
+
+    with db() as conn:
+        conn.execute("UPDATE sessions SET state='running' WHERE code=?", (code,))
+
+    asyncio.create_task(_fire_session_actions(code, sess["project_id"], actions))
+    return {
+        "ok": True,
+        "code": code,
+        "actions_queued": len(actions),
+        "estimated_duration_s": round(SESSION_RUN_DELAY_S * (len(actions) - 1), 1),
+    }
+
+
+@app.delete("/sessions/{code}")
+def delete_session(code: str):
+    sess = get_session(code)
+    if not sess:
+        raise HTTPException(status_code=404, detail="session not found")
+    with db() as conn:
+        conn.execute("DELETE FROM sessions WHERE code=?", (code,))
+        # Soft-delete the associated project and fall back to default if it was active.
+        was_active = conn.execute(
+            "SELECT active_flag FROM projects WHERE id=?", (sess["project_id"],)
+        ).fetchone()
+        conn.execute(
+            "UPDATE projects SET deleted=1, active_flag=0 WHERE id=?",
+            (sess["project_id"],),
+        )
+        if was_active and was_active["active_flag"]:
+            conn.execute(
+                "UPDATE projects SET active_flag=1 WHERE id=?",
+                (DEFAULT_PROJECT_ID,),
+            )
+    return {"ok": True, "code": code, "deleted": True}
+
+
+# ---------- Audience submission ----------
+@app.post("/audience/submit")
+def audience_submit(req: AudienceSubmitRequest, request: Request):
+    sess = get_session(req.code.strip())
+    if not sess:
+        raise HTTPException(status_code=404, detail="session code not found")
+    if sess["state"] != "open":
+        raise HTTPException(
+            status_code=409,
+            detail=f"session is {sess['state']} — submission window closed",
+        )
+    if session_seconds_remaining(sess) <= 0:
+        with db() as conn:
+            conn.execute("UPDATE sessions SET state='closed' WHERE code=?", (sess["code"],))
+        raise HTTPException(status_code=409, detail="submission window closed")
+
+    text = (req.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="rule text is empty")
+    if len(text) > 280:
+        raise HTTPException(status_code=400, detail="rule text too long (max 280 chars)")
+
+    # Per-IP throttle (in-memory, best effort).
+    client_ip = request.client.host if request.client else "unknown"
+    now_ts = datetime.now(timezone.utc).timestamp()
+    last = _audience_last_submit.get(client_ip, 0)
+    if now_ts - last < AUDIENCE_THROTTLE_S:
+        raise HTTPException(
+            status_code=429,
+            detail=f"slow down — wait {AUDIENCE_THROTTLE_S:.0f}s between submissions",
+        )
+    _audience_last_submit[client_ip] = now_ts
+
+    rule = generate_policy_from_text(text)
+    rule.setdefault("source_text", text)
+    pid = str(uuid.uuid4())
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO policies (id, created_at, rule_json, source, project_id) VALUES (?, ?, ?, ?, ?)",
+            (pid, now_iso(), json.dumps(rule), "audience", sess["project_id"]),
+        )
+    return {
+        "ok": True,
+        "code": sess["code"],
+        "rule": rule,
+        "rules_in_session": _serialize_session(get_session(sess["code"]))["rule_count"],
+    }
+
+
 @app.get("/health")
 def health():
     return {
@@ -627,6 +1405,8 @@ def health():
         "gemini": _gemini_ready,
         "slack": bool(SLACK_WEBHOOK_URL),
         "db": DB_PATH,
+        "learning": LEARNING_PATH,
+        "active_project": get_active_project_id(),
         "time": now_iso(),
     }
 
@@ -667,6 +1447,12 @@ DASHBOARD_HTML = r"""<!doctype html>
   .badge.blocked  { background: rgba(239,68,68,0.12); color: var(--red); border: 1px solid rgba(239,68,68,0.25); }
   .badge.pending_approval { background: rgba(245,158,11,0.12); color: var(--yellow); border: 1px solid rgba(245,158,11,0.25); }
   .badge.denied { background: rgba(239,68,68,0.12); color: var(--red); border: 1px solid rgba(239,68,68,0.25); }
+  .badge.learned { background: rgba(139,92,246,0.12); color: #a78bfa; border: 1px solid rgba(139,92,246,0.30); }
+  .badge.project { background: rgba(59,130,246,0.10); color: var(--blue); border: 1px solid rgba(59,130,246,0.25); }
+  .row.learned { border-left-color: #a78bfa; }
+  select.project-select { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); font-size: 13px; padding: 6px 10px; border-radius: 4px; outline: none; cursor: pointer; }
+  select.project-select:hover { background: #1a1a1a; }
+  select.project-select:focus { border-color: var(--blue); }
   .fade-in { animation: fade-in .2s ease-out; }
   @keyframes fade-in { from { opacity: 0; transform: translateY(-2px); } to { opacity: 1; transform: none; } }
   .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 4px; font-size: 12px; font-weight: 500; border: 1px solid var(--border); background: #1a1a1a; color: var(--text); cursor: pointer; }
@@ -687,10 +1473,15 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body class="min-h-screen">
 
-<header class="border-b border-[var(--border)] px-6 py-4 flex items-center justify-between">
+<header class="border-b border-[var(--border)] px-6 py-4 flex items-center justify-between gap-4 flex-wrap">
   <div class="flex items-center gap-3">
     <div class="mono text-lg font-semibold tracking-tight">LEDGER</div>
     <div class="text-[11px] text-[var(--muted)] uppercase tracking-widest">Policy & Evidence Layer for Agent Spend</div>
+  </div>
+  <div class="flex items-center gap-3 ml-auto">
+    <span class="text-[10px] text-[var(--muted)] uppercase tracking-widest">Project</span>
+    <select id="project-switcher" class="project-select"></select>
+    <button id="project-new" class="btn" title="Create a new project">+ new</button>
   </div>
   <div class="flex items-center gap-4 text-xs text-[var(--muted)]">
     <span><span class="dot live"></span> <span id="live-text">live</span></span>
@@ -721,13 +1512,40 @@ DASHBOARD_HTML = r"""<!doctype html>
 
   <!-- Right column -->
   <section class="col-span-12 lg:col-span-4 flex flex-col gap-4">
+    <!-- Live Session -->
+    <div class="panel">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+        <div class="flex items-center gap-2">
+          <h2 class="text-sm font-semibold uppercase tracking-widest">Live Session</h2>
+          <span id="session-state-badge" class="badge" style="display:none"></span>
+        </div>
+        <span id="session-meta" class="text-xs text-[var(--muted)] mono"></span>
+      </div>
+      <div id="session-body" class="p-4 flex flex-col gap-3"></div>
+    </div>
+
     <!-- Policies -->
-    <div class="panel flex-1">
+    <div class="panel">
       <div class="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
         <h2 class="text-sm font-semibold uppercase tracking-widest">Active Policies</h2>
         <span id="policy-count" class="text-xs text-[var(--muted)] mono"></span>
       </div>
-      <div id="policies" class="scrollbar overflow-auto max-h-[36vh] p-3 flex flex-col gap-2"></div>
+      <div id="policies" class="scrollbar overflow-auto max-h-[30vh] p-3 flex flex-col gap-2"></div>
+    </div>
+
+    <!-- Learned Patterns -->
+    <div class="panel">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+        <div class="flex items-center gap-2">
+          <h2 class="text-sm font-semibold uppercase tracking-widest">Learned Patterns</h2>
+          <span class="badge learned">RL</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span id="learning-count" class="text-xs text-[var(--muted)] mono"></span>
+          <button id="learning-reset" class="btn" title="Reset all learning (clears learning.json)">reset</button>
+        </div>
+      </div>
+      <div id="learning" class="scrollbar overflow-auto max-h-[22vh] p-3 flex flex-col gap-2"></div>
     </div>
 
     <!-- Policy Copilot -->
@@ -742,7 +1560,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           rows="3"
           placeholder="Describe a policy in plain English… e.g. 'Agents can't spin up GPU clusters on weekends without VP approval.'"></textarea>
         <div class="flex items-center justify-between mt-2">
-          <span id="copilot-status" class="text-xs text-[var(--muted)]">Press Enter to generate · Shift+Enter for newline</span>
+          <span id="copilot-status" class="text-xs text-[var(--muted)]">Adds to <span id="copilot-target" class="mono"></span> · Enter to generate</span>
           <button id="copilot-submit" class="btn btn-primary">Generate rule</button>
         </div>
         <div id="copilot-result" class="mt-3 hidden"></div>
@@ -753,14 +1571,32 @@ DASHBOARD_HTML = r"""<!doctype html>
 
 <script>
 const ENDPOINTS = {
-  audit: '/audit?limit=50',
-  policies: '/policies',
+  audit: (pid) => `/audit?limit=50&project_id=${encodeURIComponent(pid)}`,
+  policies: (pid) => `/policies?project_id=${encodeURIComponent(pid)}`,
+  learning: (pid) => `/learning?project_id=${encodeURIComponent(pid)}`,
+  learningReset: '/learning',
   fromText: '/policies/from_text',
   approve: (id) => `/approve/${id}`,
+  projects: '/projects',
+  activate: (pid) => `/projects/${encodeURIComponent(pid)}/activate`,
+  createProject: '/projects',
   health: '/health',
+  sessions: '/sessions',
+  newSession: '/sessions',
+  closeSession: (code) => `/sessions/${code}/close`,
+  generateAgent: (code) => `/sessions/${code}/generate`,
+  runAgent: (code) => `/sessions/${code}/run`,
 };
 
-const state = { actions: [], policies: [], expanded: new Set() };
+const state = {
+  actions: [],
+  policies: [],
+  learning: {},
+  projects: [],
+  activeProject: 'default',
+  expanded: new Set(),
+  session: null,
+};
 
 function fmtMoney(n) {
   const num = Number(n || 0);
@@ -782,6 +1618,10 @@ function truncHash(h) {
 
 function badge(verdict) {
   return `<span class="badge ${verdict}">${verdict.replace('_',' ')}</span>`;
+}
+
+function isLearned(action) {
+  return (action.rule_violated || '').startsWith('learned_pattern');
 }
 
 function escapeHtml(s) {
@@ -808,14 +1648,17 @@ function renderActions() {
     const cat = action.category || '—';
     const isExpanded = state.expanded.has(a.id);
     const decided = a.human_decision;
+    const learned = isLearned(a);
+    const rowClass = learned ? 'learned' : a.verdict;
     return `
-      <div class="row ${a.verdict} px-4 py-3 border-b border-[var(--border)] cursor-pointer fade-in" data-id="${a.id}">
+      <div class="row ${rowClass} px-4 py-3 border-b border-[var(--border)] cursor-pointer fade-in" data-id="${a.id}">
         <div class="flex items-center gap-3 text-sm">
           <span class="mono text-[var(--muted)] text-xs w-16">${timeShort(a.timestamp)}</span>
           <span class="mono text-[var(--muted)] text-xs w-40 truncate" title="${escapeHtml(a.agent_id)}">${escapeHtml(a.agent_id)}</span>
           <span class="flex-1 truncate">${escapeHtml(desc)}</span>
           <span class="mono text-xs text-right w-24">${escapeHtml(fmtMoney(cost))}</span>
           ${badge(a.verdict)}
+          ${learned ? '<span class="badge learned" title="Auto-approved from learned history">learned</span>' : ''}
           ${decided ? `<span class="badge ${decided === 'approved' ? 'approved' : 'denied'}">${decided}</span>` : ''}
         </div>
         ${isExpanded ? `
@@ -845,9 +1688,10 @@ function renderActions() {
 
 function renderPolicies() {
   const root = document.getElementById('policies');
-  document.getElementById('policy-count').textContent = state.policies.length + ' active';
+  document.getElementById('policy-count').textContent =
+    state.policies.length + ' active · ' + state.activeProject;
   if (!state.policies.length) {
-    root.innerHTML = '<div class="text-xs text-[var(--muted)] px-2 py-4">No policies active.</div>';
+    root.innerHTML = `<div class="text-xs text-[var(--muted)] px-2 py-4">No policies active in <span class="mono">${escapeHtml(state.activeProject)}</span>.</div>`;
     return;
   }
   root.innerHTML = state.policies.map(p => {
@@ -867,6 +1711,159 @@ function renderPolicies() {
   }).join('');
 }
 
+function renderProjects() {
+  const sel = document.getElementById('project-switcher');
+  const opts = state.projects.map(p => {
+    const lbl = `${p.name} (${p.id}) — ${p.policy_count} rules, ${p.action_count} actions`;
+    return `<option value="${escapeHtml(p.id)}" ${p.id === state.activeProject ? 'selected' : ''}>${escapeHtml(lbl)}</option>`;
+  }).join('');
+  if (sel.innerHTML !== opts) sel.innerHTML = opts;
+  document.getElementById('copilot-target').textContent = state.activeProject;
+}
+
+function renderLearning() {
+  const root = document.getElementById('learning');
+  const sigs = Object.entries(state.learning.signatures || {});
+  document.getElementById('learning-count').textContent =
+    sigs.length + (sigs.length === 1 ? ' pattern' : ' patterns');
+  if (!sigs.length) {
+    root.innerHTML = `<div class="text-xs text-[var(--muted)] px-2 py-4">No learned patterns yet. Approve or deny pending actions and they will appear here. ${LEARN_MIN_APPROVALS_HINT}</div>`;
+    return;
+  }
+  // Sort by approved_count descending.
+  sigs.sort((a, b) => (b[1].approved_count - a[1].approved_count) || (b[1].denied_count - a[1].denied_count));
+  root.innerHTML = sigs.map(([key, s]) => {
+    const ready = (s.denied_count === 0 && s.approved_count >= 3);
+    return `
+      <div class="panel-2 px-3 py-2">
+        <div class="flex items-center justify-between gap-2">
+          <div class="mono text-[11px] truncate" title="${escapeHtml(key)}">${escapeHtml(key)}</div>
+          ${ready ? '<span class="badge learned" title="Will auto-approve similar actions">auto</span>' : ''}
+        </div>
+        <div class="flex items-center gap-3 text-xs mt-1">
+          <span class="text-[var(--green)]">✓ ${s.approved_count}</span>
+          <span class="text-[var(--red)]">✗ ${s.denied_count}</span>
+          ${s.min_approved_cost != null ? `<span class="text-[var(--muted)] mono">range $${Number(s.min_approved_cost).toLocaleString()}–$${Number(s.max_approved_cost).toLocaleString()}</span>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+const LEARN_MIN_APPROVALS_HINT = '<span class="mono">3+ approvals · 0 denials → auto</span>';
+
+function audienceUrlFor(code) {
+  return `${location.origin}/audience?code=${code}`;
+}
+
+function qrSrc(code) {
+  const url = encodeURIComponent(audienceUrlFor(code));
+  return `https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=8&data=${url}`;
+}
+
+function renderSession() {
+  const body = document.getElementById('session-body');
+  const meta = document.getElementById('session-meta');
+  const badge = document.getElementById('session-state-badge');
+  const s = state.session;
+
+  if (!s) {
+    badge.style.display = 'none';
+    meta.textContent = '';
+    body.innerHTML = `
+      <div class="text-sm text-[var(--muted)]">
+        No live session. Start one to let the audience write rules from their phones.
+      </div>
+      <button id="session-new" class="btn btn-primary" style="align-self:flex-start">Start new session</button>
+    `;
+    document.getElementById('session-new').onclick = onNewSession;
+    return;
+  }
+
+  const stateColor = {
+    open: 'pending_approval', closed: 'pending_approval',
+    agent_ready: 'project',   running: 'project',
+    completed: 'approved',
+  }[s.state] || 'pending_approval';
+  badge.className = 'badge ' + stateColor;
+  badge.textContent = s.state.replace('_', ' ');
+  badge.style.display = '';
+  meta.textContent = `${s.rule_count} rules · ${s.action_count} actions`;
+
+  const url = audienceUrlFor(s.code);
+  const isOpen = s.state === 'open' && s.seconds_remaining > 0;
+  const showRun  = s.state === 'agent_ready';
+  const showGen  = s.state === 'closed' || (s.state === 'open' && s.rule_count > 0);
+  const showNew  = ['completed','running','agent_ready','closed'].includes(s.state);
+
+  body.innerHTML = `
+    <div class="flex items-start gap-4">
+      <div class="flex-1">
+        <div class="mono text-[10px] uppercase tracking-widest text-[var(--muted)] mb-1">Session code</div>
+        <div class="mono text-4xl tracking-[0.3em] leading-none">${escapeHtml(s.code)}</div>
+        <div class="mono text-[11px] text-[var(--muted)] mt-2 break-all">${escapeHtml(url)}</div>
+        ${isOpen ? `<div class="text-xs text-[var(--yellow)] mt-2"><b>${s.seconds_remaining}s</b> remaining</div>` : ''}
+      </div>
+      <img src="${qrSrc(s.code)}" alt="QR" class="rounded border border-[var(--border)] bg-white" width="100" height="100" />
+    </div>
+
+    ${s.generated_actions ? `
+      <div class="panel-2 px-3 py-2">
+        <div class="text-[10px] uppercase tracking-widest text-[var(--muted)] mb-2">Generated adversarial agent</div>
+        <ol class="text-xs space-y-1">
+          ${s.generated_actions.map(a => `
+            <li class="flex items-center gap-2">
+              <span class="mono text-[var(--muted)] w-24 truncate">${escapeHtml(a.category || '')}</span>
+              <span class="flex-1 truncate">${escapeHtml(a.description || '')}</span>
+              <span class="mono">${escapeHtml(fmtMoney(a.cost_usd ?? 0))}</span>
+            </li>
+          `).join('')}
+        </ol>
+      </div>` : ''}
+
+    <div class="flex flex-wrap items-center gap-2">
+      ${isOpen   ? '<button id="session-close" class="btn">Close window</button>' : ''}
+      ${showGen  ? '<button id="session-gen"   class="btn">Generate adversarial agent</button>' : ''}
+      ${showRun  ? '<button id="session-run"   class="btn btn-primary">Run agent</button>' : ''}
+      ${showNew  ? '<button id="session-new"   class="btn">Start new session</button>' : ''}
+    </div>
+  `;
+
+  document.getElementById('session-close')?.addEventListener('click', onCloseSession);
+  document.getElementById('session-gen')?.addEventListener('click', onGenerateAgent);
+  document.getElementById('session-run')?.addEventListener('click', onRunAgent);
+  document.getElementById('session-new')?.addEventListener('click', onNewSession);
+}
+
+async function onNewSession() {
+  try {
+    const s = await fetchJSON(ENDPOINTS.newSession, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    state.session = s;
+    state.activeProject = s.project_id;
+    state.expanded.clear();
+    await poll();
+  } catch (e) { alert('Failed to start session: ' + e.message); }
+}
+async function onCloseSession() {
+  if (!state.session) return;
+  try { await fetchJSON(ENDPOINTS.closeSession(state.session.code), { method: 'POST' }); await poll(); }
+  catch (e) { alert('Failed: ' + e.message); }
+}
+async function onGenerateAgent() {
+  if (!state.session) return;
+  const btn = document.getElementById('session-gen');
+  if (btn) { btn.disabled = true; btn.textContent = 'Generating with Gemini…'; }
+  try { await fetchJSON(ENDPOINTS.generateAgent(state.session.code), { method: 'POST' }); await poll(); }
+  catch (e) { alert('Failed: ' + e.message); }
+}
+async function onRunAgent() {
+  if (!state.session) return;
+  try { await fetchJSON(ENDPOINTS.runAgent(state.session.code), { method: 'POST' }); await poll(); }
+  catch (e) { alert('Failed: ' + e.message); }
+}
+
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
   if (!r.ok) throw new Error(`${url} -> ${r.status}`);
@@ -875,14 +1872,29 @@ async function fetchJSON(url, opts) {
 
 async function poll() {
   try {
-    const [acts, pols] = await Promise.all([
-      fetchJSON(ENDPOINTS.audit),
-      fetchJSON(ENDPOINTS.policies),
+    const [projects, sessions] = await Promise.all([
+      fetchJSON(ENDPOINTS.projects),
+      fetchJSON(ENDPOINTS.sessions),
+    ]);
+    state.projects = projects;
+    const active = projects.find(p => p.active);
+    if (active) state.activeProject = active.id;
+    // Most recent session is the "current" one. May be null.
+    state.session = sessions.length ? sessions[0] : null;
+    const pid = state.activeProject;
+    const [acts, pols, learn] = await Promise.all([
+      fetchJSON(ENDPOINTS.audit(pid)),
+      fetchJSON(ENDPOINTS.policies(pid)),
+      fetchJSON(ENDPOINTS.learning(pid)),
     ]);
     state.actions = acts;
     state.policies = pols;
+    state.learning = learn || { signatures: {} };
+    renderProjects();
     renderActions();
     renderPolicies();
+    renderLearning();
+    renderSession();
     document.getElementById('live-text').textContent = 'live';
   } catch (e) {
     document.getElementById('live-text').textContent = 'reconnecting…';
@@ -972,6 +1984,40 @@ ci.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitCopilot(); }
 });
 
+// Project switcher
+document.getElementById('project-switcher').addEventListener('change', async (ev) => {
+  const pid = ev.target.value;
+  try {
+    await fetchJSON(ENDPOINTS.activate(pid), { method: 'POST' });
+    state.activeProject = pid;
+    state.expanded.clear();
+    await poll();
+  } catch (e) { alert('Failed to switch: ' + e.message); }
+});
+
+document.getElementById('project-new').addEventListener('click', async () => {
+  const id = prompt('Project id (alphanumeric, dashes/underscores allowed):');
+  if (!id) return;
+  const name = prompt('Project display name:', id) || id;
+  try {
+    await fetchJSON(ENDPOINTS.createProject, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, name }),
+    });
+    await fetchJSON(ENDPOINTS.activate(id.trim().toLowerCase()), { method: 'POST' });
+    await poll();
+  } catch (e) { alert('Failed: ' + e.message); }
+});
+
+document.getElementById('learning-reset').addEventListener('click', async () => {
+  if (!confirm('Wipe all learned patterns? This clears learning.json across every project.')) return;
+  try {
+    await fetchJSON(ENDPOINTS.learningReset, { method: 'DELETE' });
+    await poll();
+  } catch (e) { alert('Failed: ' + e.message); }
+});
+
 poll();
 refreshHealth();
 setInterval(poll, 1000);
@@ -988,6 +2034,149 @@ def dashboard():
     return HTMLResponse(DASHBOARD_HTML)
 
 
+# ---------- Audience page ----------
+AUDIENCE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no" />
+<title>Write a rule · Ledger demo</title>
+<style>
+  :root {
+    --bg: #0a0a0a; --panel: #141414; --border: #1f1f1f;
+    --text: #e5e5e5; --muted: #8a8a8a;
+    --green: #10b981; --red: #ef4444; --yellow: #f59e0b; --blue: #3b82f6;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { background: var(--bg); color: var(--text); margin: 0; min-height: 100vh; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    padding: 24px 18px 48px;
+    display: flex; flex-direction: column; align-items: stretch; gap: 16px;
+    max-width: 460px; margin: 0 auto;
+  }
+  .mono { font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace; }
+  .brand { font-size: 12px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  h1 { font-size: 22px; margin: 6px 0 4px; line-height: 1.2; font-weight: 600; }
+  p.intro { color: var(--muted); font-size: 14px; line-height: 1.4; margin: 0 0 6px; }
+  label { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); margin-bottom: 6px; }
+  input[type="text"], textarea {
+    width: 100%;
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 12px; font-size: 16px;
+    outline: none;
+  }
+  input[type="text"]:focus, textarea:focus { border-color: var(--blue); }
+  textarea { resize: vertical; min-height: 120px; font-family: inherit; }
+  #code { font-family: ui-monospace, "SF Mono", monospace; letter-spacing: 0.5em; font-size: 28px; text-align: center; padding: 16px 12px; }
+  button {
+    width: 100%; padding: 14px 16px; border-radius: 6px; border: 0;
+    background: var(--green); color: #00120b; font-size: 16px; font-weight: 600; cursor: pointer;
+    transition: background 100ms ease;
+  }
+  button:active { background: #0a8f63; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .status { font-size: 13px; padding: 12px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); display: none; }
+  .status.ok { display: block; border-color: rgba(16,185,129,0.35); color: var(--green); background: rgba(16,185,129,0.08); }
+  .status.err { display: block; border-color: rgba(239,68,68,0.35); color: var(--red); background: rgba(239,68,68,0.08); }
+  .status.info { display: block; border-color: rgba(59,130,246,0.35); color: var(--blue); background: rgba(59,130,246,0.08); }
+  .meta { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .rule-preview { font-family: ui-monospace, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-word; margin-top: 8px; color: var(--text); }
+  .footer { text-align: center; font-size: 11px; color: var(--muted); margin-top: 12px; }
+</style>
+</head>
+<body>
+  <div class="brand">Ledger · Live demo</div>
+  <h1>Write a rule for our AI agent</h1>
+  <p class="intro">
+    Type a governance rule in plain English — anything like
+    <span class="mono">"no spend over $200"</span> or
+    <span class="mono">"block payments to crypto vendors"</span>.
+    We will turn it into a policy. After the timer ends, an AI agent will try to break it on stage.
+  </p>
+
+  <div>
+    <label for="code">Session code</label>
+    <input type="text" id="code" inputmode="numeric" maxlength="4" autocomplete="off" placeholder="0000" />
+  </div>
+
+  <div>
+    <label for="rule">Your rule</label>
+    <textarea id="rule" maxlength="280" placeholder="No spending over $500. No GPU on weekends. Block payments to crypto vendors. …"></textarea>
+    <div class="meta"><span id="counter">0</span> / 280</div>
+  </div>
+
+  <button id="submit">Submit rule</button>
+  <div id="status" class="status"></div>
+
+  <div class="footer">Submissions are anonymous · one rule per ~5 seconds</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const codeInput = document.getElementById('code');
+const ruleInput = document.getElementById('rule');
+const submitBtn = document.getElementById('submit');
+const statusEl = document.getElementById('status');
+const counter = document.getElementById('counter');
+
+if (params.get('code')) codeInput.value = params.get('code').slice(0,4);
+
+ruleInput.addEventListener('input', () => { counter.textContent = ruleInput.value.length; });
+codeInput.addEventListener('input', () => {
+  codeInput.value = codeInput.value.replace(/\D/g, '').slice(0,4);
+});
+
+function show(kind, msg, preview) {
+  statusEl.className = 'status ' + kind;
+  statusEl.innerHTML = msg + (preview ? `<div class="rule-preview">${preview}</div>` : '');
+}
+
+submitBtn.addEventListener('click', async () => {
+  const code = codeInput.value.trim();
+  const text = ruleInput.value.trim();
+  if (code.length !== 4) { show('err', 'Session code must be 4 digits.'); return; }
+  if (text.length < 3)  { show('err', 'Type a rule first.'); return; }
+  submitBtn.disabled = true;
+  show('info', 'Generating policy…');
+  try {
+    const r = await fetch('/audience/submit', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({code, text}),
+    });
+    const out = await r.json();
+    if (!r.ok) {
+      const detail = typeof out.detail === 'string' ? out.detail : JSON.stringify(out.detail);
+      show('err', detail || `HTTP ${r.status}`);
+    } else {
+      const desc = (out.rule && out.rule.description) || '(rule added)';
+      const escape = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      show('ok', `✓ Rule #${out.rules_in_session} added to session <b>${escape(out.code)}</b>.`, escape(desc));
+      ruleInput.value = '';
+      counter.textContent = '0';
+    }
+  } catch (e) {
+    show('err', 'Network error: ' + e.message);
+  } finally {
+    submitBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/audience", response_class=HTMLResponse)
+def audience_page():
+    return HTMLResponse(AUDIENCE_HTML)
+
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8000)),
+        reload=False,
+    )
