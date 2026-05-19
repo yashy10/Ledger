@@ -8,7 +8,9 @@ for human approval, and logs every decision with a SHA-256 hash for audit.
 import os
 import json
 import hashlib
+import hmac
 import sqlite3
+import time
 import uuid
 import random
 import asyncio
@@ -17,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
+from urllib.parse import parse_qs
 
 
 def _load_dotenv(path: Path) -> None:
@@ -48,6 +51,7 @@ DB_PATH = os.environ.get("LEDGER_DB", "ledger.db")
 LEARNING_PATH = os.environ.get("LEDGER_LEARNING", "learning.json")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 # Auto-approve thresholds for the learning store.
@@ -665,6 +669,52 @@ def post_slack_approval_request(
         log.warning("Slack post failed for %s: %s", action_id, e)
 
 
+def verify_slack_signature(raw_body: bytes, timestamp: str, signature: str) -> bool:
+    """Verify Slack's request signature using HMAC-SHA256.
+    See https://api.slack.com/authentication/verifying-requests-from-slack"""
+    if not SLACK_SIGNING_SECRET:
+        return False
+    try:
+        # Reject replays older than 5 minutes.
+        if abs(time.time() - int(timestamp)) > 60 * 5:
+            return False
+    except (TypeError, ValueError):
+        return False
+    basestring = f"v0:{timestamp}:{raw_body.decode('utf-8', errors='replace')}".encode("utf-8")
+    expected = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode("utf-8"),
+        basestring,
+        hashlib.sha256,
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def slack_decision_blocks(action_id: str, decision: str, decided_by: str,
+                          decided_at: str, prior_blocks: Optional[list] = None) -> list:
+    """Build the replacement Slack message blocks after a human decision.
+    Preserves the context lines from the original card so the audit trail stays visible."""
+    emoji = "✅" if decision == "approved" else "🛑"
+    color_word = "Approved" if decision == "approved" else "Denied"
+    blocks: list = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{emoji} {color_word} by {decided_by}", "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Decided at*\n`{decided_at}`"},
+        },
+    ]
+    # Carry forward the original section + context blocks (everything except the buttons
+    # and the original header) so the approver/audience still sees the context.
+    if prior_blocks:
+        for b in prior_blocks:
+            t = b.get("type")
+            if t in ("section", "context"):
+                blocks.append(b)
+    return blocks
+
+
 # ---------- Policy Copilot ----------
 POLICY_COPILOT_SYSTEM = """You convert plain-English governance policies into a single JSON rule.
 
@@ -860,6 +910,7 @@ def startup() -> None:
         "  │  API docs:   http://localhost:8000/docs                     │\n"
         f"  │  Gemini:     {'configured' if _gemini_ready else 'not configured (set GEMINI_API_KEY)':<46} │\n"
         f"  │  Slack:      {'configured' if SLACK_WEBHOOK_URL else 'not configured (set SLACK_WEBHOOK_URL)':<46} │\n"
+        f"  │  Slack btns: {'configured' if SLACK_SIGNING_SECRET else 'not configured (set SLACK_SIGNING_SECRET)':<46} │\n"
         f"  │  DB:         {DB_PATH:<46} │\n"
         f"  │  Learning:   {LEARNING_PATH:<46} │\n"
         f"  │  Project:    {get_active_project_id():<46} │\n"
@@ -952,9 +1003,11 @@ def audit_one(action_id: str):
     return dict(row)
 
 
-@app.post("/approve/{action_id}")
-def approve(action_id: str, body: ApprovalRequest):
-    if body.decision not in ("approved", "denied"):
+def _apply_approval(action_id: str, decision: str, decided_by: str) -> dict:
+    """Apply a human approval decision to a pending action.
+    Shared between the dashboard's /approve endpoint and Slack's /slack/interact callback.
+    Raises HTTPException on validation failure. Returns the updated row as dict."""
+    if decision not in ("approved", "denied"):
         raise HTTPException(status_code=400, detail="decision must be 'approved' or 'denied'")
     decided_at = now_iso()
     with db() as conn:
@@ -973,7 +1026,7 @@ def approve(action_id: str, body: ApprovalRequest):
             )
         conn.execute(
             "UPDATE actions SET human_decision=?, decided_at=?, decided_by=? WHERE id=?",
-            (body.decision, decided_at, body.decided_by, action_id),
+            (decision, decided_at, decided_by, action_id),
         )
         updated = conn.execute("SELECT * FROM actions WHERE id=?", (action_id,)).fetchone()
 
@@ -986,12 +1039,97 @@ def approve(action_id: str, body: ApprovalRequest):
             cost=float(action_json.get("cost_usd", 0) or 0),
             description=action_json.get("description") or "",
             action_id=action_id,
-            decision=body.decision,
+            decision=decision,
         )
     except Exception as e:  # noqa: BLE001
         log.warning("learning update failed for %s: %s", action_id, e)
 
     return dict(updated)
+
+
+@app.post("/approve/{action_id}")
+def approve(action_id: str, body: ApprovalRequest):
+    return _apply_approval(action_id, body.decision, body.decided_by)
+
+
+@app.post("/slack/interact")
+async def slack_interact(request: Request):
+    """Slack Interactivity callback for Approve/Deny buttons on approval cards.
+
+    Slack POSTs application/x-www-form-urlencoded with a single `payload` field
+    containing JSON. We must verify the request signature before trusting any of it."""
+    if not SLACK_SIGNING_SECRET:
+        # Endpoint exists but isn't configured — return 200 with a soft message so
+        # Slack stops retrying, but make the misconfig obvious in logs.
+        log.warning("/slack/interact hit but SLACK_SIGNING_SECRET is not set")
+        return JSONResponse(
+            {"response_type": "ephemeral",
+             "text": "Slack interactivity is not configured on this Ledger instance."}
+        )
+
+    raw = await request.body()
+    ts = request.headers.get("X-Slack-Request-Timestamp", "")
+    sig = request.headers.get("X-Slack-Signature", "")
+    if not verify_slack_signature(raw, ts, sig):
+        raise HTTPException(status_code=401, detail="invalid Slack signature")
+
+    parsed = parse_qs(raw.decode("utf-8"))
+    payload_field = parsed.get("payload")
+    if not payload_field:
+        raise HTTPException(status_code=400, detail="missing payload")
+    try:
+        payload = json.loads(payload_field[0])
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="payload is not valid JSON")
+
+    actions = payload.get("actions") or []
+    if not actions:
+        raise HTTPException(status_code=400, detail="no actions in payload")
+    button = actions[0]
+    button_id = button.get("action_id")
+    action_id = button.get("value")
+    if not action_id:
+        raise HTTPException(status_code=400, detail="button missing action_id value")
+
+    if button_id == "approve_action":
+        decision = "approved"
+    elif button_id == "deny_action":
+        decision = "denied"
+    else:
+        raise HTTPException(status_code=400, detail=f"unknown button: {button_id}")
+
+    user = payload.get("user") or {}
+    user_name = (
+        user.get("username")
+        or user.get("name")
+        or user.get("id")
+        or "slack-user"
+    )
+    decided_by = f"slack:{user_name}"
+
+    try:
+        updated = _apply_approval(action_id, decision, decided_by)
+    except HTTPException as e:
+        # Already-decided or not-pending is fine — tell Slack the story without erroring.
+        return JSONResponse({
+            "response_type": "ephemeral",
+            "replace_original": False,
+            "text": f"⚠️ Could not apply decision: {e.detail}",
+        })
+
+    # Swap the original card to show the decision. Slack reads this response body.
+    new_blocks = slack_decision_blocks(
+        action_id=action_id,
+        decision=decision,
+        decided_by=user_name,
+        decided_at=updated["decided_at"],
+        prior_blocks=(payload.get("message") or {}).get("blocks"),
+    )
+    return {
+        "replace_original": True,
+        "text": f"Action {decision} by {user_name}",
+        "blocks": new_blocks,
+    }
 
 
 @app.get("/policies")

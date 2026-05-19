@@ -16,6 +16,8 @@ services:
         sync: false
       - key: SLACK_WEBHOOK_URL
         sync: false
+      - key: SLACK_SIGNING_SECRET
+        sync: false
       - key: GEMINI_MODEL
         value: gemini-flash-latest
     disk:
