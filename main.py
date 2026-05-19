@@ -1672,13 +1672,16 @@ def audience_submit(req: AudienceSubmitRequest, request: Request):
 def admin_reset():
     """Restore the dashboard to its first-version state: close any audience sessions,
     soft-delete session projects, drop any user-added rules from the default project
-    (keeping the seeded defaults), and reactivate the default project.
+    (keeping the seeded defaults), clear the live action stream / audit log, and
+    reactivate the default project.
 
-    Preserves: audit log, learning store, the seeded default policies.
-    Removes: active sessions and their projects, copilot/audience/manual rules in default."""
+    Preserves: learning store, the seeded default policies.
+    Removes: active sessions, session projects, copilot/audience/manual rules in
+    default, every row in the audit log (the dashboard returns to a blank stream)."""
     closed_sessions = 0
     deleted_projects = 0
     removed_policies = 0
+    removed_actions = 0
     with db() as conn:
         # Close every session that's not already closed/completed and soft-delete its project.
         sess_rows = conn.execute(
@@ -1709,6 +1712,11 @@ def admin_reset():
         )
         removed_policies = cur.rowcount or 0
 
+        # Clear the live action stream — every row across every project. The dashboard
+        # should look like it did before anyone tapped a button.
+        cur = conn.execute("DELETE FROM actions")
+        removed_actions = cur.rowcount or 0
+
         # Make sure default is active.
         conn.execute("UPDATE projects SET active_flag=0")
         conn.execute(
@@ -1724,8 +1732,9 @@ def admin_reset():
         "closed_sessions": closed_sessions,
         "deleted_projects": deleted_projects,
         "removed_user_policies": removed_policies,
+        "removed_actions": removed_actions,
         "active_project": get_active_project_id(),
-        "message": "Reset complete — default project active, seeded policies restored.",
+        "message": "Reset complete — default project active, audit stream cleared, seeded policies restored.",
     }
 
 
@@ -2358,7 +2367,8 @@ document.getElementById('admin-reset').addEventListener('click', async () => {
     '• Any audience session will be closed\n' +
     '• You will return to the default project\n' +
     '• Rules added via Policy Copilot or audience submissions will be removed\n' +
-    '• Audit log and learning history are preserved\n\n' +
+    '• The live action stream will be cleared (every audit row deleted)\n' +
+    '• Learning history is preserved (use the Learned Patterns "reset" to clear it)\n\n' +
     'Continue?'
   );
   if (!ok) return;
@@ -2369,10 +2379,11 @@ document.getElementById('admin-reset').addEventListener('click', async () => {
     const out = await fetchJSON(ENDPOINTS.adminReset, { method: 'POST' });
     state.activeProject = out.active_project || 'default';
     state.expanded.clear();
+    state.actions = [];
     state.session = null;
     await poll();
-    btn.textContent = `Reset ✓  (closed ${out.closed_sessions}, removed ${out.removed_user_policies} rules)`;
-    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
+    btn.textContent = `Reset ✓  (closed ${out.closed_sessions}, ${out.removed_user_policies} rules, ${out.removed_actions} actions)`;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 3000);
   } catch (e) {
     btn.disabled = false; btn.textContent = orig;
     alert('Reset failed: ' + e.message);
