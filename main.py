@@ -1668,6 +1668,67 @@ def audience_submit(req: AudienceSubmitRequest, request: Request):
     }
 
 
+@app.post("/admin/reset")
+def admin_reset():
+    """Restore the dashboard to its first-version state: close any audience sessions,
+    soft-delete session projects, drop any user-added rules from the default project
+    (keeping the seeded defaults), and reactivate the default project.
+
+    Preserves: audit log, learning store, the seeded default policies.
+    Removes: active sessions and their projects, copilot/audience/manual rules in default."""
+    closed_sessions = 0
+    deleted_projects = 0
+    removed_policies = 0
+    with db() as conn:
+        # Close every session that's not already closed/completed and soft-delete its project.
+        sess_rows = conn.execute(
+            "SELECT code, project_id FROM sessions WHERE state NOT IN ('closed','completed')"
+        ).fetchall()
+        for s in sess_rows:
+            conn.execute(
+                "UPDATE sessions SET state='closed', opened_until=? WHERE code=?",
+                (now_iso(), s["code"]),
+            )
+            closed_sessions += 1
+
+        # Soft-delete every non-default project so the switcher and active flag clear up.
+        proj_rows = conn.execute(
+            "SELECT id FROM projects WHERE id != ? AND deleted=0",
+            (DEFAULT_PROJECT_ID,),
+        ).fetchall()
+        for p in proj_rows:
+            conn.execute(
+                "UPDATE projects SET deleted=1, active_flag=0 WHERE id=?", (p["id"],)
+            )
+            deleted_projects += 1
+
+        # Remove non-seed policies from the default project (keep the originals).
+        cur = conn.execute(
+            "DELETE FROM policies WHERE project_id=? AND source != 'default'",
+            (DEFAULT_PROJECT_ID,),
+        )
+        removed_policies = cur.rowcount or 0
+
+        # Make sure default is active.
+        conn.execute("UPDATE projects SET active_flag=0")
+        conn.execute(
+            "UPDATE projects SET active_flag=1 WHERE id=? AND deleted=0",
+            (DEFAULT_PROJECT_ID,),
+        )
+
+    # Re-run init to refill any missing seed policies (idempotent).
+    init_db()
+
+    return {
+        "ok": True,
+        "closed_sessions": closed_sessions,
+        "deleted_projects": deleted_projects,
+        "removed_user_policies": removed_policies,
+        "active_project": get_active_project_id(),
+        "message": "Reset complete — default project active, seeded policies restored.",
+    }
+
+
 @app.get("/health")
 def health():
     return {
@@ -1752,6 +1813,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <span class="text-[10px] text-[var(--muted)] uppercase tracking-widest">Project</span>
     <select id="project-switcher" class="project-select"></select>
     <button id="project-new" class="btn" title="Create a new project">+ new</button>
+    <button id="admin-reset" class="btn btn-danger" title="Close any audience session, switch back to the default project, and restore the original seeded policies. Audit log and learning are preserved.">↺ Reset to defaults</button>
   </div>
   <div class="flex items-center gap-4 text-xs text-[var(--muted)]">
     <span><span class="dot live"></span> <span id="live-text">live</span></span>
@@ -1858,6 +1920,7 @@ const ENDPOINTS = {
   generateAgent: (code) => `/sessions/${code}/generate`,
   runAgent: (code) => `/sessions/${code}/run`,
   runDemo: '/demo/run',
+  adminReset: '/admin/reset',
 };
 
 const state = {
@@ -2287,6 +2350,33 @@ document.getElementById('project-switcher').addEventListener('change', async (ev
     state.expanded.clear();
     await poll();
   } catch (e) { alert('Failed to switch: ' + e.message); }
+});
+
+document.getElementById('admin-reset').addEventListener('click', async () => {
+  const ok = confirm(
+    'Reset to defaults?\n\n' +
+    '• Any audience session will be closed\n' +
+    '• You will return to the default project\n' +
+    '• Rules added via Policy Copilot or audience submissions will be removed\n' +
+    '• Audit log and learning history are preserved\n\n' +
+    'Continue?'
+  );
+  if (!ok) return;
+  const btn = document.getElementById('admin-reset');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Resetting…';
+  try {
+    const out = await fetchJSON(ENDPOINTS.adminReset, { method: 'POST' });
+    state.activeProject = out.active_project || 'default';
+    state.expanded.clear();
+    state.session = null;
+    await poll();
+    btn.textContent = `Reset ✓  (closed ${out.closed_sessions}, removed ${out.removed_user_policies} rules)`;
+    setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2500);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = orig;
+    alert('Reset failed: ' + e.message);
+  }
 });
 
 document.getElementById('project-new').addEventListener('click', async () => {
