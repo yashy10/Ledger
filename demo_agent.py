@@ -2,9 +2,15 @@
 demo_agent.py — Scripted DevOps agent that fires 8 actions at Ledger.
 The 5th action is the $48K H100 GPU trap that should trigger Slack approval.
 
-Run:
+Run (local server):
     python3 demo_agent.py
+
+Run against a remote (e.g. Render) deployment:
+    python3 demo_agent.py https://ledger.onrender.com
+    # or:
+    LEDGER_URL=https://ledger.onrender.com python3 demo_agent.py
 """
+import os
 import sys
 import time
 import json
@@ -12,7 +18,10 @@ from collections import Counter
 
 import requests
 
-LEDGER_URL = "http://localhost:8000"
+LEDGER_URL = (
+    sys.argv[1].rstrip("/") if len(sys.argv) > 1
+    else os.environ.get("LEDGER_URL", "http://localhost:8000").rstrip("/")
+)
 AGENT_ID = "devops-agent-prod-01"
 TASK = "Provision dev environment for customer demo next week"
 DELAY_SECONDS = 1.5

@@ -11,3 +11,4 @@ ledger.db-journal
 *.sqlite-journal
 learning.json
 learning.json.tmp
+VIDEO_SCRIPT.md
