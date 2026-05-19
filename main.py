@@ -197,12 +197,76 @@ def init_db() -> None:
             {"type": "category_block", "categories": ["gpu_provisioning"],
              "requires_approval": True, "approval_threshold_usd": 1000,
              "description": "GPU provisioning over $1,000 requires approval"},
+            {"type": "time_window",
+             "block_hours": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5],
+             "block_categories": ["vendor_payment"],
+             "description": "Vendor payments after 8 PM require approval"},
+            {"type": "time_window",
+             "block_days": ["Sat", "Sun"],
+             "block_categories": ["all"],
+             "description": "No provisioning of any kind on weekends without approval"},
+            {"type": "category_block", "categories": ["crypto_mining"],
+             "requires_approval": True, "approval_threshold_usd": 0,
+             "description": "Crypto mining is never permitted — always requires approval"},
         ]
         for rule in defaults:
             cur.execute(
                 "INSERT INTO policies (id, created_at, rule_json, source, project_id) VALUES (?, ?, ?, ?, ?)",
                 (str(uuid.uuid4()), now_iso(), json.dumps(rule), "default", DEFAULT_PROJECT_ID),
             )
+
+    # Idempotent backfill: make sure the demo-specific blocking policies exist in the
+    # default project even on DBs that were seeded before these rules became defaults.
+    # Each block here is one stress-test scenario the canonical demo agent exercises.
+    cur.execute(
+        "SELECT rule_json FROM policies WHERE active=1 AND project_id=?",
+        (DEFAULT_PROJECT_ID,),
+    )
+    existing_rules = [json.loads(r[0]) for r in cur.fetchall()]
+
+    def _ensure_rule(present: bool, rule: dict) -> None:
+        if not present:
+            cur.execute(
+                "INSERT INTO policies (id, created_at, rule_json, source, project_id) VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), now_iso(), json.dumps(rule), "default", DEFAULT_PROJECT_ID),
+            )
+
+    has_vendor_window = any(
+        r.get("type") == "time_window"
+        and "vendor_payment" in [c.lower() for c in (r.get("block_categories") or [])]
+        for r in existing_rules
+    )
+    _ensure_rule(has_vendor_window, {
+        "type": "time_window",
+        "block_hours": [20, 21, 22, 23, 0, 1, 2, 3, 4, 5],
+        "block_categories": ["vendor_payment"],
+        "description": "Vendor payments after 8 PM require approval",
+    })
+
+    has_weekend_lockdown = any(
+        r.get("type") == "time_window"
+        and set(r.get("block_days") or []) >= {"Sat", "Sun"}
+        for r in existing_rules
+    )
+    _ensure_rule(has_weekend_lockdown, {
+        "type": "time_window",
+        "block_days": ["Sat", "Sun"],
+        "block_categories": ["all"],
+        "description": "No provisioning of any kind on weekends without approval",
+    })
+
+    has_crypto_block = any(
+        r.get("type") == "category_block"
+        and "crypto_mining" in [c.lower() for c in (r.get("categories") or [])]
+        for r in existing_rules
+    )
+    _ensure_rule(has_crypto_block, {
+        "type": "category_block",
+        "categories": ["crypto_mining"],
+        "requires_approval": True,
+        "approval_threshold_usd": 0,
+        "description": "Crypto mining is never permitted — always requires approval",
+    })
 
     # Make sure exactly one project is active.
     cur.execute("SELECT COUNT(*) FROM projects WHERE active_flag=1 AND deleted=0")
@@ -498,9 +562,24 @@ def evaluate_action(task: str, action: dict, policies: list, project_id: str) ->
             detail=f"action.cost_usd must be a number (got {raw_cost!r})",
         )
     category = (action.get("category") or "").lower()
-    now = datetime.now(timezone.utc)
-    day_name = DAY_NAMES[now.weekday()]
-    hour = now.hour
+
+    # Time used for time_window checks. Actions may declare a `requested_at` ISO
+    # datetime for scheduled-future actions (e.g. "process this invoice at 9:30 PM");
+    # in that case the policy engine evaluates against the *intended* execution time,
+    # not the moment the action was submitted. Otherwise fall back to wall clock.
+    requested_at = action.get("requested_at")
+    eval_dt: Optional[datetime] = None
+    if isinstance(requested_at, str) and requested_at:
+        try:
+            eval_dt = datetime.fromisoformat(requested_at.replace("Z", "+00:00"))
+            if eval_dt.tzinfo is None:
+                eval_dt = eval_dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            eval_dt = None
+    if eval_dt is None:
+        eval_dt = datetime.now(timezone.utc)
+    day_name = DAY_NAMES[eval_dt.weekday()]
+    hour = eval_dt.hour
 
     intent_rule_present = False
     pending: Optional[dict] = None  # first pending verdict from deterministic checks
@@ -837,8 +916,22 @@ FALLBACK_ACTIONS = [
     {"type": "provision", "category": "networking",       "cost_usd": 8,     "description": "Load balancer + TLS cert"},
     {"type": "provision", "category": "gpu_provisioning", "cost_usd": 48000, "description": "100x NVIDIA H100 GPUs for 24h"},
     {"type": "provision", "category": "storage",          "cost_usd": 18,    "description": "Container registry pull"},
-    {"type": "payment",   "category": "vendor_payment",   "cost_usd": 2400,  "description": "External contractor invoice"},
+    {"type": "payment",   "category": "vendor_payment",   "cost_usd": 2400,
+     "description": "External contractor invoice (business hours)",
+     "requested_at": "2026-05-19T14:00:00+00:00"},
     {"type": "provision", "category": "database",         "cost_usd": 60,    "description": "Managed Postgres instance"},
+    # Stress-test blockers below. Each one trips a distinct policy type and gives the
+    # demo a clear "the system caught this" beat.
+    {"type": "payment",   "category": "vendor_payment",   "cost_usd": 3200,
+     "description": "Scheduled vendor invoice #4471 — execute at 9:30 PM tonight",
+     "requested_at": "2026-05-19T21:30:00+00:00"},
+    {"type": "provision", "category": "storage",          "cost_usd": 500,
+     "description": "Saturday backup snapshot to S3 cold storage",
+     "requested_at": "2026-05-23T14:00:00+00:00"},
+    {"type": "provision", "category": "compute",          "cost_usd": 9500,
+     "description": "Premium 32-core analytics VM for quarterly batch"},
+    {"type": "provision", "category": "crypto_mining",    "cost_usd": 1200,
+     "description": "Ethereum miner pool worker (8x GPU instance)"},
 ]
 
 
@@ -1464,6 +1557,45 @@ async def run_session_agent(code: str):
     }
 
 
+# ---------- Canonical demo agent (replaces running demo_agent.py from terminal) ----------
+async def _fire_demo_actions(project_id: str) -> None:
+    """Background runner for /demo/run. Streams the canonical 8 FALLBACK_ACTIONS
+    through the policy engine with a 1.2s delay between each so they appear live on
+    the dashboard — same behavior as demo_agent.py, but no terminal required."""
+    for i, action in enumerate(FALLBACK_ACTIONS):
+        req = ActionRequest(
+            agent_id="devops-agent-prod-01",
+            task="Provision dev environment for customer demo next week",
+            action=action,
+            project_id=project_id,
+        )
+        try:
+            agent_action(req)
+        except HTTPException as e:
+            log.warning("demo action %d failed: %s", i, e.detail)
+        except Exception as e:  # noqa: BLE001
+            log.warning("demo action %d errored: %s", i, e)
+        if i < len(FALLBACK_ACTIONS) - 1:
+            await asyncio.sleep(SESSION_RUN_DELAY_S)
+
+
+@app.post("/demo/run")
+async def run_demo_agent(project_id: Optional[str] = None):
+    """Fire the canonical 8-action demo (storage, db, vm, lb, the $48K H100 trap, ...)
+    through the policy engine in the background. Call this from the dashboard button
+    so you don't have to alt-tab to a terminal during the stage demo."""
+    target = project_id or get_active_project_id()
+    if not project_exists(target):
+        raise HTTPException(status_code=400, detail=f"unknown project_id: {target}")
+    asyncio.create_task(_fire_demo_actions(target))
+    return {
+        "ok": True,
+        "project_id": target,
+        "actions_queued": len(FALLBACK_ACTIONS),
+        "estimated_duration_s": round(SESSION_RUN_DELAY_S * (len(FALLBACK_ACTIONS) - 1), 1),
+    }
+
+
 @app.delete("/sessions/{code}")
 def delete_session(code: str):
     sess = get_session(code)
@@ -1636,6 +1768,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <span id="action-count" class="text-xs text-[var(--muted)] mono"></span>
       </div>
       <div class="flex items-center gap-3 text-xs text-[var(--muted)]">
+        <button id="demo-run" class="btn btn-primary" title="Fire the canonical 8-action demo (includes the $48K H100 trap)">▶ Run demo agent</button>
         <span><span class="badge approved">approved</span></span>
         <span><span class="badge pending_approval">pending</span></span>
         <span><span class="badge blocked">blocked</span></span>
@@ -1644,7 +1777,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <div id="actions" class="scrollbar overflow-auto max-h-[78vh]"></div>
     <div id="empty" class="px-6 py-12 text-center text-sm text-[var(--muted)] hidden">
       Waiting for agent actions…<br>
-      <span class="mono text-xs">run <span class="text-[var(--text)]">python3 demo_agent.py</span> to start the demo</span>
+      <span class="text-xs">Click <span class="text-[var(--green)]">▶ Run demo agent</span> above to start the demo</span>
     </div>
   </section>
 
@@ -1724,6 +1857,7 @@ const ENDPOINTS = {
   closeSession: (code) => `/sessions/${code}/close`,
   generateAgent: (code) => `/sessions/${code}/generate`,
   runAgent: (code) => `/sessions/${code}/run`,
+  runDemo: '/demo/run',
 };
 
 const state = {
@@ -2120,6 +2254,28 @@ async function submitCopilot() {
 submitBtn.addEventListener('click', submitCopilot);
 ci.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitCopilot(); }
+});
+
+// Run demo agent (fires the canonical 8 actions through the policy engine, server-side)
+const demoBtn = document.getElementById('demo-run');
+demoBtn.addEventListener('click', async () => {
+  const originalText = demoBtn.textContent;
+  demoBtn.disabled = true;
+  demoBtn.textContent = 'Firing actions…';
+  try {
+    const out = await fetchJSON(ENDPOINTS.runDemo, { method: 'POST' });
+    const total = (out.estimated_duration_s || 12) * 1000 + 1500;
+    // Poll faster while the demo streams so the UI keeps up.
+    await poll();
+    setTimeout(() => {
+      demoBtn.disabled = false;
+      demoBtn.textContent = originalText;
+    }, total);
+  } catch (e) {
+    demoBtn.disabled = false;
+    demoBtn.textContent = originalText;
+    alert('Failed to start demo: ' + e.message);
+  }
 });
 
 // Project switcher
