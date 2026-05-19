@@ -1825,6 +1825,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button id="admin-reset" class="btn btn-danger" title="Close any audience session, switch back to the default project, and restore the original seeded policies. Audit log and learning are preserved.">↺ Reset to defaults</button>
   </div>
   <div class="flex items-center gap-4 text-xs text-[var(--muted)]">
+    <a href="/architecture" target="_blank" class="text-xs uppercase tracking-widest text-[var(--muted)] hover:text-white">Architecture →</a>
     <span><span class="dot live"></span> <span id="live-text">live</span></span>
     <span id="health-state" class="mono"></span>
   </div>
@@ -2565,6 +2566,304 @@ submitBtn.addEventListener('click', async () => {
 @app.get("/audience", response_class=HTMLResponse)
 def audience_page():
     return HTMLResponse(AUDIENCE_HTML)
+
+
+# ---------- Architecture page (for stage presentation) ----------
+ARCHITECTURE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Ledger — System Architecture</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --panel: #141414;
+    --panel-2: #1a1a1a;
+    --border: #2a2a2a;
+    --text: #f5f5f5;
+    --muted: #8a8a8a;
+    --green: #10b981;
+    --yellow: #f59e0b;
+    --red: #ef4444;
+    --blue: #3b82f6;
+    --purple: #a78bfa;
+  }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, system-ui, sans-serif; }
+  .mono { font-family: ui-monospace, "SF Mono", "JetBrains Mono", monospace; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.05em; }
+  .pill-green  { background: rgba(16,185,129,0.15);  color: var(--green); }
+  .pill-yellow { background: rgba(245,158,11,0.15);  color: var(--yellow); }
+  .pill-red    { background: rgba(239,68,68,0.15);   color: var(--red); }
+  .pill-blue   { background: rgba(59,130,246,0.15);  color: var(--blue); }
+  .pill-purple { background: rgba(167,139,250,0.15); color: var(--purple); }
+</style>
+</head>
+<body>
+
+<header class="border-b border-[var(--border)] px-8 py-5 flex items-center justify-between">
+  <div>
+    <div class="text-xs text-[var(--muted)] uppercase tracking-widest">Ledger</div>
+    <h1 class="text-2xl font-semibold mt-1">System Architecture</h1>
+    <p class="text-sm text-[var(--muted)] mt-1">The policy and evidence layer for autonomous AI agent actions.</p>
+  </div>
+  <a href="/" class="text-sm text-[var(--muted)] hover:text-white">← back to dashboard</a>
+</header>
+
+<main class="px-8 py-8 max-w-[1400px] mx-auto">
+
+  <!-- ============== MAIN FLOW DIAGRAM ============== -->
+  <section class="panel p-6 mb-8">
+    <h2 class="text-xs text-[var(--muted)] uppercase tracking-widest mb-4">Runtime flow</h2>
+    <svg viewBox="0 0 1320 540" class="w-full h-auto" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arrow-green"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#10b981"/>
+        </marker>
+        <marker id="arrow-yellow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#f59e0b"/>
+        </marker>
+        <marker id="arrow-blue"   viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#3b82f6"/>
+        </marker>
+        <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#a78bfa"/>
+        </marker>
+        <marker id="arrow-muted"  viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+          <path d="M0,0 L10,5 L0,10 Z" fill="#8a8a8a"/>
+        </marker>
+      </defs>
+
+      <!-- =========== AI AGENTS (LEFT) =========== -->
+      <g>
+        <rect x="20" y="170" width="200" height="200" rx="8" fill="#141414" stroke="#3b82f6" stroke-width="1.5"/>
+        <text x="120" y="200" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="700" letter-spacing="2">AI AGENTS</text>
+        <line x1="40" y1="215" x2="200" y2="215" stroke="#2a2a2a"/>
+        <text x="120" y="245" text-anchor="middle" fill="#f5f5f5" font-size="13" font-family="ui-monospace,monospace">LangChain</text>
+        <text x="120" y="275" text-anchor="middle" fill="#f5f5f5" font-size="13" font-family="ui-monospace,monospace">CrewAI</text>
+        <text x="120" y="305" text-anchor="middle" fill="#f5f5f5" font-size="13" font-family="ui-monospace,monospace">AutoGen</text>
+        <text x="120" y="335" text-anchor="middle" fill="#f5f5f5" font-size="13" font-family="ui-monospace,monospace">Custom Python</text>
+        <text x="120" y="360" text-anchor="middle" fill="#8a8a8a" font-size="11">any framework</text>
+      </g>
+
+      <!-- Arrow: Agents -> Ledger -->
+      <line x1="220" y1="270" x2="380" y2="270" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+      <text x="300" y="258" text-anchor="middle" fill="#10b981" font-size="12" font-weight="600" font-family="ui-monospace,monospace">POST /agent/action</text>
+      <text x="300" y="288" text-anchor="middle" fill="#8a8a8a" font-size="10">one HTTP call. sub-100ms.</text>
+
+      <!-- =========== LEDGER PROXY (MIDDLE) =========== -->
+      <g>
+        <rect x="380" y="60" width="580" height="430" rx="10" fill="#0f0f0f" stroke="#10b981" stroke-width="2"/>
+        <text x="670" y="92" text-anchor="middle" fill="#10b981" font-size="14" font-weight="700" letter-spacing="2">LEDGER PROXY (FastAPI)</text>
+
+        <!-- Policy Engine sub-box -->
+        <rect x="410" y="120" width="320" height="170" rx="6" fill="#141414" stroke="#2a2a2a"/>
+        <text x="570" y="145" text-anchor="middle" fill="#f5f5f5" font-size="13" font-weight="700">POLICY ENGINE</text>
+        <text x="570" y="162" text-anchor="middle" fill="#8a8a8a" font-size="11">deterministic first · LLM second</text>
+        <text x="430" y="190" fill="#10b981" font-size="12" font-family="ui-monospace,monospace">• budget_cap</text>
+        <text x="430" y="210" fill="#10b981" font-size="12" font-family="ui-monospace,monospace">• category_block</text>
+        <text x="430" y="230" fill="#10b981" font-size="12" font-family="ui-monospace,monospace">• time_window</text>
+        <text x="430" y="250" fill="#a78bfa" font-size="12" font-family="ui-monospace,monospace">• intent_alignment</text>
+        <text x="430" y="276" fill="#8a8a8a" font-size="10">all rules compose per action</text>
+
+        <!-- Gemini sub-box (right of policy engine) -->
+        <rect x="755" y="120" width="180" height="170" rx="6" fill="#141414" stroke="#a78bfa"/>
+        <text x="845" y="145" text-anchor="middle" fill="#a78bfa" font-size="12" font-weight="700">GEMINI 2.0 FLASH</text>
+        <line x1="775" y1="158" x2="915" y2="158" stroke="#2a2a2a"/>
+        <text x="845" y="180" text-anchor="middle" fill="#f5f5f5" font-size="11">intent alignment</text>
+        <text x="845" y="200" text-anchor="middle" fill="#f5f5f5" font-size="11">policy copilot</text>
+        <text x="845" y="220" text-anchor="middle" fill="#f5f5f5" font-size="11">adversarial agent</text>
+        <text x="845" y="245" text-anchor="middle" fill="#8a8a8a" font-size="10">structured JSON</text>
+        <text x="845" y="260" text-anchor="middle" fill="#8a8a8a" font-size="10">schema-enforced</text>
+
+        <!-- Arrow: Policy Engine ↔ Gemini -->
+        <line x1="730" y1="195" x2="755" y2="195" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-purple)"/>
+        <line x1="755" y1="215" x2="730" y2="215" stroke="#a78bfa" stroke-width="1.5" marker-end="url(#arrow-purple)"/>
+
+        <!-- Evidence Store sub-box -->
+        <rect x="410" y="320" width="525" height="140" rx="6" fill="#141414" stroke="#3b82f6"/>
+        <text x="672" y="345" text-anchor="middle" fill="#3b82f6" font-size="13" font-weight="700">EVIDENCE STORE</text>
+        <text x="672" y="362" text-anchor="middle" fill="#8a8a8a" font-size="11">tamper-evident audit trail</text>
+        <text x="430" y="392" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">SHA-256 hash</text>
+        <text x="430" y="412" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">canonical JSON</text>
+        <text x="430" y="432" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">ISO-8601 UTC</text>
+        <text x="600" y="392" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">verdict</text>
+        <text x="600" y="412" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">rule_violated</text>
+        <text x="600" y="432" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">decided_by</text>
+        <text x="770" y="392" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">reasoning</text>
+        <text x="770" y="412" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">decided_at</text>
+        <text x="770" y="432" fill="#f5f5f5" font-size="12" font-family="ui-monospace,monospace">project_id</text>
+
+        <!-- Arrow: Policy Engine -> Evidence Store -->
+        <line x1="570" y1="290" x2="570" y2="320" stroke="#10b981" stroke-width="2" marker-end="url(#arrow-green)"/>
+        <text x="595" y="310" fill="#10b981" font-size="11">write</text>
+      </g>
+
+      <!-- Arrow: Ledger -> Approver (Slack) when pending -->
+      <line x1="960" y1="190" x2="1110" y2="190" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow-yellow)"/>
+      <text x="1035" y="178" text-anchor="middle" fill="#f59e0b" font-size="11" font-weight="600">if pending_approval</text>
+      <text x="1035" y="206" text-anchor="middle" fill="#8a8a8a" font-size="10">Slack Block Kit card</text>
+
+      <!-- Arrow: Approver decision back to Evidence -->
+      <line x1="1110" y1="270" x2="960" y2="270" stroke="#f59e0b" stroke-width="2" marker-end="url(#arrow-yellow)"/>
+      <text x="1035" y="262" text-anchor="middle" fill="#f59e0b" font-size="11" font-weight="600">HMAC-signed callback</text>
+      <text x="1035" y="288" text-anchor="middle" fill="#8a8a8a" font-size="10">/slack/interact</text>
+
+      <!-- Arrow: Ledger -> Dashboard -->
+      <line x1="960" y1="400" x2="1110" y2="400" stroke="#3b82f6" stroke-width="2" marker-end="url(#arrow-blue)"/>
+      <text x="1035" y="390" text-anchor="middle" fill="#3b82f6" font-size="11" font-weight="600">audit stream</text>
+      <text x="1035" y="416" text-anchor="middle" fill="#8a8a8a" font-size="10">live polling</text>
+
+      <!-- =========== HUMANS (RIGHT) =========== -->
+      <g>
+        <rect x="1110" y="120" width="200" height="160" rx="8" fill="#141414" stroke="#f59e0b" stroke-width="1.5"/>
+        <text x="1210" y="150" text-anchor="middle" fill="#f59e0b" font-size="12" font-weight="700" letter-spacing="2">APPROVER</text>
+        <line x1="1130" y1="165" x2="1290" y2="165" stroke="#2a2a2a"/>
+        <text x="1210" y="195" text-anchor="middle" fill="#f5f5f5" font-size="13">Slack on phone</text>
+        <text x="1210" y="220" text-anchor="middle" fill="#f5f5f5" font-size="13">tap Approve / Deny</text>
+        <text x="1210" y="250" text-anchor="middle" fill="#8a8a8a" font-size="11">full context in card</text>
+        <text x="1210" y="265" text-anchor="middle" fill="#8a8a8a" font-size="11">one tap, no new tool</text>
+
+        <rect x="1110" y="330" width="200" height="140" rx="8" fill="#141414" stroke="#3b82f6" stroke-width="1.5"/>
+        <text x="1210" y="360" text-anchor="middle" fill="#3b82f6" font-size="12" font-weight="700" letter-spacing="2">AUDIT DASHBOARD</text>
+        <line x1="1130" y1="375" x2="1290" y2="375" stroke="#2a2a2a"/>
+        <text x="1210" y="403" text-anchor="middle" fill="#f5f5f5" font-size="13">live action stream</text>
+        <text x="1210" y="425" text-anchor="middle" fill="#f5f5f5" font-size="13">policy copilot</text>
+        <text x="1210" y="447" text-anchor="middle" fill="#f5f5f5" font-size="13">learning store</text>
+      </g>
+
+      <!-- Legend -->
+      <g transform="translate(20, 500)">
+        <text x="0" y="0" fill="#8a8a8a" font-size="11" font-weight="600" letter-spacing="2">LEGEND</text>
+        <line x1="60" y1="-4" x2="90" y2="-4" stroke="#10b981" stroke-width="2"/>
+        <text x="95" y="0" fill="#8a8a8a" font-size="11">approve path</text>
+        <line x1="190" y1="-4" x2="220" y2="-4" stroke="#f59e0b" stroke-width="2"/>
+        <text x="225" y="0" fill="#8a8a8a" font-size="11">human-in-the-loop</text>
+        <line x1="345" y1="-4" x2="375" y2="-4" stroke="#a78bfa" stroke-width="2"/>
+        <text x="380" y="0" fill="#8a8a8a" font-size="11">LLM call</text>
+        <line x1="450" y1="-4" x2="480" y2="-4" stroke="#3b82f6" stroke-width="2"/>
+        <text x="485" y="0" fill="#8a8a8a" font-size="11">read / observe</text>
+      </g>
+    </svg>
+  </section>
+
+  <!-- ============== THREE PILLARS ============== -->
+  <section class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+    <div class="panel p-5">
+      <div class="text-xs text-[var(--green)] font-semibold tracking-widest mb-2">LAYER 1</div>
+      <h3 class="text-lg font-semibold mb-2">Runtime policy proxy</h3>
+      <p class="text-sm text-[var(--muted)] mb-4">Every agent action flows through Ledger before it touches the world. Deterministic checks run first in &lt;100ms. Gemini only runs when intent-alignment is configured and deterministic checks passed.</p>
+      <div class="flex flex-wrap gap-2">
+        <span class="pill pill-green">sub-100ms p95</span>
+        <span class="pill pill-green">composable rules</span>
+        <span class="pill pill-green">framework-agnostic</span>
+      </div>
+    </div>
+
+    <div class="panel p-5">
+      <div class="text-xs text-[var(--blue)] font-semibold tracking-widest mb-2">LAYER 2</div>
+      <h3 class="text-lg font-semibold mb-2">Tamper-evident evidence</h3>
+      <p class="text-sm text-[var(--muted)] mb-4">Every action gets a SHA-256 hash over the canonical JSON payload + timestamp. Re-canonicalize and re-hash to verify. This is the exact artifact auditors ask for.</p>
+      <div class="flex flex-wrap gap-2">
+        <span class="pill pill-blue">SHA-256 per row</span>
+        <span class="pill pill-blue">canonical JSON</span>
+        <span class="pill pill-blue">ISO-8601 UTC</span>
+      </div>
+    </div>
+
+    <div class="panel p-5">
+      <div class="text-xs text-[var(--yellow)] font-semibold tracking-widest mb-2">LAYER 3</div>
+      <h3 class="text-lg font-semibold mb-2">Human-in-the-loop</h3>
+      <p class="text-sm text-[var(--muted)] mb-4">Pending actions push a Slack Block Kit card with full context. One tap decides. The decision is HMAC-verified, written to the audit log with the approver's identity, and feeds the learning store.</p>
+      <div class="flex flex-wrap gap-2">
+        <span class="pill pill-yellow">Slack-native</span>
+        <span class="pill pill-yellow">HMAC verified</span>
+        <span class="pill pill-yellow">decision logged</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== VERDICTS ============== -->
+  <section class="panel p-6 mb-8">
+    <h2 class="text-xs text-[var(--muted)] uppercase tracking-widest mb-4">Three verdicts. One agent. One source of truth.</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div class="border-l-4 border-[var(--green)] pl-4">
+        <div class="text-[var(--green)] font-semibold text-base mb-1">✓ APPROVED</div>
+        <p class="text-sm text-[var(--muted)]">Action allowed. Agent proceeds. Row written with hash.</p>
+      </div>
+      <div class="border-l-4 border-[var(--yellow)] pl-4">
+        <div class="text-[var(--yellow)] font-semibold text-base mb-1">⚠ PENDING APPROVAL</div>
+        <p class="text-sm text-[var(--muted)]">Slack ping fires. Human decides. Decision written back, learning store updated bidirectionally.</p>
+      </div>
+      <div class="border-l-4 border-[var(--red)] pl-4">
+        <div class="text-[var(--red)] font-semibold text-base mb-1">✕ DENIED</div>
+        <p class="text-sm text-[var(--muted)]">Agent aborts. Denial recorded — that pattern never auto-approves again.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== REINFORCEMENT LEARNING ============== -->
+  <section class="panel p-6 mb-8">
+    <h2 class="text-xs text-[var(--muted)] uppercase tracking-widest mb-4">The learning loop</h2>
+    <div class="text-sm leading-relaxed">
+      <p class="mb-3">Every approval and denial is recorded under a signature key: <span class="mono pill pill-blue">project_id + category + cost_bucket</span>.</p>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+        <div>
+          <div class="text-[var(--green)] font-semibold mb-1">Positive reinforcement</div>
+          <p class="text-[var(--muted)]">After N repeated human approvals of the same pattern, future similar actions auto-approve. Humans stop getting paged for confirmed patterns.</p>
+        </div>
+        <div>
+          <div class="text-[var(--red)] font-semibold mb-1">Negative reinforcement (sticky)</div>
+          <p class="text-[var(--muted)]">A single human denial of a pattern blocks auto-approval forever. Confidence is asymmetric — the system trusts denials more than approvals.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== COMPLIANCE ============== -->
+  <section class="panel p-6 mb-8">
+    <h2 class="text-xs text-[var(--muted)] uppercase tracking-widest mb-4">Compliance frameworks this satisfies</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm">
+      <div>
+        <div class="font-semibold mb-1">SOC 2 Type II</div>
+        <p class="text-[var(--muted)]">CC7.2 (system monitoring), CC6.1 (logical access). The hash chain is the auditor's primitive for "show me evidence controls operated effectively."</p>
+      </div>
+      <div>
+        <div class="font-semibold mb-1">EU AI Act</div>
+        <p class="text-[var(--muted)]">Article 12 (automatic event logging for high-risk AI). Article 14 (human oversight). Both satisfied in one shot.</p>
+      </div>
+      <div>
+        <div class="font-semibold mb-1">NIST AI RMF</div>
+        <p class="text-[var(--muted)]">GOVERN-1.5 (ongoing monitoring and periodic review). MAP-3.4 (third-party risk).</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============== POSITIONING ============== -->
+  <section class="panel p-6 mb-8">
+    <h2 class="text-xs text-[var(--muted)] uppercase tracking-widest mb-4">Where Ledger sits in the stack</h2>
+    <div class="text-sm leading-relaxed text-[var(--text)]">
+      <p class="mb-3">Tools like <span class="mono">Lakera</span>, <span class="mono">Guardrails AI</span>, and <span class="mono">Promptfoo</span> evaluate the model's <em>outputs</em> — hallucinations, jailbreaks, content safety.</p>
+      <p class="mb-3"><span class="text-[var(--green)] font-semibold">Ledger governs the agent's <em>actions</em></span> — the spend, the API calls, the infrastructure changes, the money.</p>
+      <p class="text-[var(--muted)]">Different layer. Complementary. Most production deployments will use both.</p>
+    </div>
+  </section>
+
+  <footer class="text-xs text-[var(--muted)] text-center pt-4 pb-8">
+    Ledger — the policy &amp; evidence layer for autonomous agent spend.
+  </footer>
+</main>
+
+</body>
+</html>
+"""
+
+
+@app.get("/architecture", response_class=HTMLResponse)
+def architecture_page():
+    return HTMLResponse(ARCHITECTURE_HTML)
 
 
 if __name__ == "__main__":
